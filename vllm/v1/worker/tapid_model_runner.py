@@ -584,6 +584,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
 
         request_id = self._tapid_next_request
         self._tapid_next_request += 1
+        door_started = time.monotonic()
         self.tapid_session.submit_hidden(
             request_id, hidden[:rows], self._tapid_hidden_size
         )
@@ -592,6 +593,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             rows * self._tapid_hidden_size,
             timeout_ms=_TAPID_FETCH_TIMEOUT_MS,
         )
+        door_seconds = time.monotonic() - door_started
         if (out_rows, out_cols) != (rows, self._tapid_hidden_size):
             raise RuntimeError(
                 f"TAPID returned {out_rows}x{out_cols}, expected "
@@ -611,8 +613,10 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self._tapid_steps += 1
         if self._tapid_steps % _TAPID_PREFILL_LOG_EVERY == 1:
             logger.info(
-                "TAPID prefill #%d: rows=%d request_id=%#x",
-                self._tapid_steps, rows, request_id,
+                "TAPID prefill #%d: rows=%d request_id=%#x door=%.4fs "
+                "(%.0f tok/s)",
+                self._tapid_steps, rows, request_id, door_seconds,
+                rows / door_seconds if door_seconds > 0 else 0,
             )
         return normed
 
