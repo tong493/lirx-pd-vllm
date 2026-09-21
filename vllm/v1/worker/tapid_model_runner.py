@@ -214,29 +214,56 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         )
 
     def _free_decoder_weights(self) -> None:
-        """Release every non-skeleton parameter back to the allocator.
+        """Release the decoder-layer parameters back to the allocator.
 
         The persistent-kernel program is the only consumer of the decoder
-        weights, so the vLLM copies are dead weight (~50 GiB). Params become
-        empty meta tensors: any accidental access fails loudly instead of
-        silently computing on dummy values.
+        weights, so the vLLM copies are dead weight (~50 GiB). Only decoder
+        layer params (``.layers.`` in the attribute path) are freed — the
+        embedding, final norm, lm_head, and vision tower stay real.
+
+        Params become empty meta tensors: any accidental access fails loudly
+        instead of silently computing on dummy values. Some params are tensor
+        subclasses (e.g. DTensor) whose ``set_data`` refuses a plain meta
+        tensor; for those the registered attribute is replaced wholesale.
         """
-        skeleton_params = {
-            "model.embed_tokens.weight",
-            "model.norm.weight",
-            "lm_head.weight",
-        }
         freed_bytes = 0
+        skipped: list[str] = []
         with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if name in skeleton_params:
+            for name, param in list(self.model.named_parameters()):
+                if name.endswith(
+                    ("embed_tokens.weight", "lm_head.weight", "model.norm.weight")
+                ) or ".layers." not in name:
                     continue
+                meta_empty = torch.empty(
+                    0, dtype=param.dtype, device="meta"
+                )
+                try:
+                    param.data = meta_empty
+                except RuntimeError:
+                    # Subclass params: swap the registered attribute itself.
+                    try:
+                        parent_name, leaf = name.rsplit(".", 1)
+                        parent = self.model.get_submodule(parent_name)
+                        setattr(
+                            parent,
+                            leaf,
+                            torch.nn.Parameter(
+                                meta_empty, requires_grad=False
+                            ),
+                        )
+                    except Exception as exc:
+                        skipped.append(f"{name} ({type(param).__name__}: {exc})")
+                        continue
                 freed_bytes += param.numel() * param.element_size()
-                param.data = torch.empty(0, dtype=param.dtype, device="meta")
         logger.info(
             "TAPID: freed %.1f GiB of decoder parameters from the vLLM model",
             freed_bytes / (1 << 30),
         )
+        if skipped:
+            logger.info(
+                "TAPID: %d params kept real (unfreable): %s",
+                len(skipped), "; ".join(skipped[:8]),
+            )
 
     def _bind_tapid_weights(self) -> None:
         """Convert the checkpoint once and upload it into TAPID's arena.
