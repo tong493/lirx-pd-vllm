@@ -88,17 +88,24 @@ def main() -> int:
     from vllm import LLM, SamplingParams
 
     if args.gpu_memory_utilization is None:
-        # vLLM refuses to start when free memory < util x total. Size the
-        # budget from what is actually free right now (co-resident processes
-        # included) minus a 1% margin; TAPID's arena and pools are allocated
-        # later, inside load_model, so they never eat into this check.
+        # vLLM refuses to start when free memory < util x total, and it
+        # consumes the whole requested budget as KV cache. Since free memory
+        # at TAPID-arm time is exactly total x (1 - util) regardless of what
+        # TAPID has allocated, cap the fraction so ~10 GiB stay free — the
+        # persistent-kernel launch stops going resident below ~8 GiB free.
         import torch
 
         free, total = torch.cuda.mem_get_info()
-        args.gpu_memory_utilization = max(0.50, free / total - 0.01)
+        headroom = 10 * (1 << 30)
+        args.gpu_memory_utilization = min(
+            free / total - 0.01,        # don't trip vLLM's startup check
+            1 - headroom / total,       # keep 10 GiB free at arm time
+        )
+        args.gpu_memory_utilization = max(0.50, args.gpu_memory_utilization)
         print(
             f"gpu-memory-utilization auto: {args.gpu_memory_utilization:.4f} "
-            f"(free {free / (1 << 30):.2f} / {total / (1 << 30):.2f} GiB)",
+            f"(free {free / (1 << 30):.2f} / {total / (1 << 30):.2f} GiB, "
+            f"reserving {headroom / (1 << 30):.0f} GiB free at arm)",
             file=sys.stderr,
         )
 
