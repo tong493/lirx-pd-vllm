@@ -255,6 +255,12 @@ def qwen_triton_warmup(
     if runner.is_pooling_model:
         return
 
+    if type(runner).__name__.startswith("Tapid"):
+        # TAPID door: the decoder (GDN/conv/gating) runs on TAPID's persistent
+        # kernel, so the vLLM Triton GDN kernels below are never invoked. Their
+        # warmup also hard-asserts dims that don't match Qwen3.6-27B.
+        return
+
     hf_text_config = getattr(model_config, "hf_text_config", None)
     hf_config = getattr(model_config, "hf_config", None)
     model_type = None
