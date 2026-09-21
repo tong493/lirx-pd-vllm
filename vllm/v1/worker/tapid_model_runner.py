@@ -368,20 +368,97 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # Same settle window the bench runner uses: the resident CTAs come up
         # before the program is swapped in.
         time.sleep(0.3)
+        logger.info(
+            "TAPID: launch returned in %.2fs; probing device before "
+            "set_program",
+            time.monotonic() - started,
+        )
+        self._log_gpu_probe()
+        self._start_probe_thread()
         payload = self.tapid_adapter.decoder_program_payload(
             self.tapid_session.abi
         )
         self.tapid_session.set_program(
             payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
         )
+        self._stop_probe_thread()
         self.tapid_armed = True
         logger.info(
             "TAPID armed: persistent prefill program resident (%.1fs)",
             time.monotonic() - started,
         )
 
-    # ---- forwards ----------------------------------------------------------
+    def _log_gpu_probe(self) -> None:
+        """Log device utilization/memory from outside the process.
 
+        ~100% util means the persistent kernel went resident and is spinning;
+        0% means the launch never took. Reads via nvidia-smi so no CUDA call
+        of our own can perturb the state being observed.
+        """
+        try:
+            import subprocess
+
+            probe = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader",
+                    "-i", str(self.device.index or 0),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            logger.info(
+                "TAPID: post-launch GPU probe (util, mem used/total): %s",
+                probe.stdout.strip() or probe.stderr.strip(),
+            )
+        except Exception as exc:
+            logger.info("TAPID: GPU probe unavailable: %s", exc)
+
+    def _start_probe_thread(self) -> None:
+        """Sample GPU util every 20s while set_program is blocking.
+
+        If the device-ack hang is the kernel spinning without consuming the
+        host command, the samples say ~100%; if the launch never took, 0%.
+        """
+        import threading
+
+        stop = threading.Event()
+
+        def _sample() -> None:
+            while not stop.wait(20):
+                try:
+                    import subprocess
+
+                    probe = subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=utilization.gpu",
+                            "--format=csv,noheader",
+                            "-i", str(self.device.index or 0),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    logger.info(
+                        "TAPID: set_program pending, GPU util: %s",
+                        probe.stdout.strip(),
+                    )
+                except Exception:
+                    pass
+
+        self._probe_stop = stop
+        threading.Thread(target=_sample, daemon=True).start()
+
+    def _stop_probe_thread(self) -> None:
+        stop = getattr(self, "_probe_stop", None)
+        if stop is not None:
+            stop.set()
+            self._probe_stop = None
+
+    # ---- forwards ----------------------------------------------------------
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
