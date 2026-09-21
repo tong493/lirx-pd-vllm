@@ -43,12 +43,14 @@ def main() -> int:
         "10240-row buffer.",
     )
     parser.add_argument("--max-num-seqs", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.99,
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None,
                         help="vLLM derives the KV-cache budget from this "
                         "fraction minus everything the process holds — and "
-                        "TAPID's arena (~45GiB) + pools (~25GiB) are part of "
-                        "that. 0.99 leaves ~0.8GiB of KV, ample for one "
-                        "10k-token prefill.")
+                        "TAPID's arena (~45GiB) + pools (~16GiB) are part of "
+                        "that. Default: auto-computed from the device's free "
+                        "memory at startup minus a 1%% margin, so small "
+                        "co-resident processes don't trip vLLM's free-memory "
+                        "check (0.99 was rejected at 78.32/79.25 GiB free).")
     parser.add_argument("--no-tapid", action="store_true",
                         help="Run the plain vLLM model (baseline).")
     parser.add_argument(
@@ -84,6 +86,21 @@ def main() -> int:
         )
 
     from vllm import LLM, SamplingParams
+
+    if args.gpu_memory_utilization is None:
+        # vLLM refuses to start when free memory < util x total. Size the
+        # budget from what is actually free right now (co-resident processes
+        # included) minus a 1% margin; TAPID's arena and pools are allocated
+        # later, inside load_model, so they never eat into this check.
+        import torch
+
+        free, total = torch.cuda.mem_get_info()
+        args.gpu_memory_utilization = max(0.50, free / total - 0.01)
+        print(
+            f"gpu-memory-utilization auto: {args.gpu_memory_utilization:.4f} "
+            f"(free {free / (1 << 30):.2f} / {total / (1 << 30):.2f} GiB)",
+            file=sys.stderr,
+        )
 
     additional_config = (
         {}
