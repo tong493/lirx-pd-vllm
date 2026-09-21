@@ -20,6 +20,7 @@ Model specifics (checkpoint conversion, program assembly, skeleton names) live
 in the TAPID repo's model assembly package; nothing here knows the model.
 """
 
+import gc
 import importlib
 import time
 from typing import Any
@@ -264,6 +265,17 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 "TAPID: %d params kept real (unfreable): %s",
                 len(skipped), "; ".join(skipped[:8]),
             )
+        # The freed tensors only return to torch's caching allocator; until
+        # they are released back to the driver, TAPID's cudaMemGetInfo-based
+        # arena sizing sees no free memory and refuses the weight upload.
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        logger.info(
+            "TAPID: device free after release: %.1f / %.1f GiB "
+            "(the arena upload needs the decoder weights' worth)",
+            free_bytes / (1 << 30), total_bytes / (1 << 30),
+        )
 
     def _bind_tapid_weights(self) -> None:
         """Convert the checkpoint once and upload it into TAPID's arena.
