@@ -12,15 +12,14 @@ import argparse
 import os
 import sys
 
-MODEL = (
-    "/data/models/hub/models--Qwen--Qwen3.6-27B/snapshots/"
-    "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
-)
+MODEL = None  # no default: pass --model /path/to/Qwen3.6-27B
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--model", required=True,
+                        help="Local HF checkpoint dir of Qwen3.6-27B (must "
+                        "contain model.safetensors.index.json)")
     parser.add_argument(
         "--prompt",
         action="append",
@@ -44,7 +43,10 @@ def main() -> int:
         "10240-row buffer.",
     )
     parser.add_argument("--max-num-seqs", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
+                        help="TAPID's arena (~50GiB weights + ~15GiB pools) "
+                        "is already on the card before profiling; 0.90 keeps "
+                        "an 80GB A100 comfortable.")
     parser.add_argument("--no-tapid", action="store_true",
                         help="Run the plain vLLM model (baseline).")
     parser.add_argument(
