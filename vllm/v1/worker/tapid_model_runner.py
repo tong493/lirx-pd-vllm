@@ -218,9 +218,9 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         """Release the decoder-layer parameters back to the allocator.
 
         The persistent-kernel program is the only consumer of the decoder
-        weights, so the vLLM copies are dead weight (~50 GiB). Only decoder
-        layer params (``.layers.`` in the attribute path) are freed — the
-        embedding, final norm, lm_head, and vision tower stay real.
+        weights, so the vLLM copies are dead weight (~50 GiB). Decoder layer
+        params (``.layers.``) and the vision tower (``.visual.``) are freed;
+        the embedding, final norm, and lm_head stay real.
 
         Params become empty meta tensors: any accidental access fails loudly
         instead of silently computing on dummy values. Some params are tensor
@@ -233,7 +233,9 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             for name, param in list(self.model.named_parameters()):
                 if name.endswith(
                     ("embed_tokens.weight", "lm_head.weight", "model.norm.weight")
-                ) or ".layers." not in name:
+                ):
+                    continue
+                if ".layers." not in name and ".visual." not in name:
                     continue
                 meta_empty = torch.empty(
                     0, dtype=param.dtype, device="meta"

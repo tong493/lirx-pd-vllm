@@ -43,10 +43,12 @@ def main() -> int:
         "10240-row buffer.",
     )
     parser.add_argument("--max-num-seqs", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
-                        help="TAPID's arena (~50GiB weights + ~15GiB pools) "
-                        "is already on the card before profiling; 0.90 keeps "
-                        "an 80GB A100 comfortable.")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.99,
+                        help="vLLM derives the KV-cache budget from this "
+                        "fraction minus everything the process holds — and "
+                        "TAPID's arena (~45GiB) + pools (~25GiB) are part of "
+                        "that. 0.99 leaves ~0.8GiB of KV, ample for one "
+                        "10k-token prefill.")
     parser.add_argument("--no-tapid", action="store_true",
                         help="Run the plain vLLM model (baseline).")
     parser.add_argument(
@@ -104,6 +106,11 @@ def main() -> int:
         # A cached-prefix prefill arrives with tokens already computed, which
         # the TAPID path refuses; every prompt must prefill fresh.
         enable_prefix_caching=False,
+        # The checkpoint resolves to the multimodal wrapper. Without this,
+        # memory profiling runs the vision tower on dummy images; on the
+        # 80GB A100 that collides with TAPID's arena+pools. Limits of 0 make
+        # the encoder budget empty, so encoder profiling is skipped.
+        limit_mm_per_prompt={"image": 0, "video": 0},
         additional_config=additional_config,
     )
     out = llm.generate(
