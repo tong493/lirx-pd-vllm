@@ -1,4 +1,10 @@
-"""End-to-end Qwen3.6-27B inference on vLLM model-runner-v2 + TAPID persistent kernel."""
+"""End-to-end Qwen3.6-27B prefill on vLLM model-runner-v2 + TAPID persistent kernel.
+
+Prefill-only door (see gpu_daemon/docs/vllm_integration.md): TAPID holds the
+only full copy of the decoder weights and runs the 64-layer prefill program;
+vLLM keeps the skeleton (embed / final norm / lm_head) and samples. Decode is
+out of scope — measure prefill with --max-tokens 1.
+"""
 
 from __future__ import annotations
 
@@ -18,31 +24,60 @@ def main() -> int:
     parser.add_argument(
         "--prompt",
         action="append",
-        help="Repeatable. Probing several lengths in one process shows how the "
-        "per-row pattern moves with the token count.",
+        help="Repeatable. One request per generate call: the TAPID path runs "
+        "a single fresh prefill per step.",
     )
-    parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1,
+        help="Tokens to sample per prompt. The TAPID path refuses decode "
+        "steps, so anything above 1 fails after the prefill.",
+    )
     parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=256)
-    parser.add_argument("--max-num-seqs", type=int, default=1)
-    # TAPID keeps a second, K-major copy of the weights alongside vLLM's own.
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
-    parser.add_argument("--no-tapid", action="store_true")
     parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Run vLLM's forward alongside TAPID's and log the divergence.",
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Defaults to max-model-len: a prompt must prefill in one step "
+        "(chunked prefill is refused), and must stay within the kernel's "
+        "10240-row buffer.",
+    )
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
+    parser.add_argument("--no-tapid", action="store_true",
+                        help="Run the plain vLLM model (baseline).")
+    parser.add_argument(
+        "--verify", action="store_true",
+        help="Ignored: the single-weight-copy design leaves no vLLM decoder "
+        "to compare against. Numerics are validated by the TAPID st suite.",
     )
     parser.add_argument(
-        "--probe",
-        default="full",
-        choices=("full", "gdn", "attention", "mlp"),
-        help="Run a single-layer TAPID program and compare it to that vLLM layer.",
+        "--probe", default="full",
+        help="Ignored: single-layer probes were part of the two-copy design.",
     )
     parser.add_argument("--probe-layer", type=int, default=0)
     parser.add_argument("--dump-tokens", default="", help="write token ids to JSON")
-    parser.add_argument("--state-audit", action="store_true")
+    parser.add_argument(
+        "--state-audit", action="store_true",
+        help="Ignored: TAPID writes no vLLM KV/GDN state in the prefill door.",
+    )
     args = parser.parse_args()
+
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = args.max_model_len
+    if args.verify or args.state_audit or args.probe != "full":
+        print(
+            "NOTE: --verify/--probe/--state-audit are ignored by the "
+            "prefill-only TAPID door.",
+            file=sys.stderr,
+        )
+    if args.max_tokens > 1:
+        print(
+            "NOTE: --max-tokens > 1 will fail on the first decode step; the "
+            "TAPID door measures prefill only.",
+            file=sys.stderr,
+        )
 
     from vllm import LLM, SamplingParams
 
@@ -52,10 +87,6 @@ def main() -> int:
         else {
             "tapid": {
                 "model_signature": "qwen3_5_dense_27b_bf16",
-                "verify": args.verify,
-                "probe": args.probe,
-                "probe_layer": args.probe_layer,
-                "state_audit": args.state_audit,
             }
         }
     )
@@ -68,8 +99,9 @@ def main() -> int:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        # Each probe prompt must produce a full prefill, not a cache hit.
-        enable_prefix_caching=args.probe == "full",
+        # A cached-prefix prefill arrives with tokens already computed, which
+        # the TAPID path refuses; every prompt must prefill fresh.
+        enable_prefix_caching=False,
         additional_config=additional_config,
     )
     out = llm.generate(

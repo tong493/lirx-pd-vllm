@@ -1,29 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""TAPID prefill runner: vLLM drives TAPID's existing host-side door.
+
+Contract (see gpu_daemon/docs/vllm_integration.md in the TAPID repo):
+
+* Single weight copy. ``load_model`` dummy-loads the model, restores real
+  weights for the skeleton only (token embedding, final norm, lm_head), frees
+  every other parameter, and uploads the full decoder into TAPID's arena via
+  ``bind_weights_from_host``. TAPID's arena is the only full copy in memory.
+* Only TAPID's host-side instructions are called (``tapid_vllm`` ->
+  pyshim C ABI): open, bind, launch, set_program, submit (F32), fetch. No
+  runtime/KV-cache binding: the submit/fetch path owns its device buffers.
+* Prefill only. The program boundary is the decoder output; vLLM applies the
+  final norm and samples. Decode, chunked prefill, and multi-request batches
+  are refused with explicit errors — with the decoder weights freed there is
+  no vLLM fallback either.
+
+Model specifics (checkpoint conversion, program assembly, skeleton names) live
+in the TAPID repo's model assembly package; nothing here knows the model.
+"""
 
 import importlib
 import time
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.tapid_qwen3_5 import (
-    build_gdn_state_index_by_layer,
-    build_prefill_step,
-    build_runtime_bindings,
-    build_v2_prefill_step,
-    build_weight_bindings,
-    get_qwen_layer_names,
-)
 
 logger = init_logger(__name__)
+
+_TAPID_DOOR_MODULE = "tapid_vllm"
+# Model-side half of the contract, on PYTHONPATH as $TAPID_REPO.
+_TAPID_ADAPTER_MODULE = "models.model_assembly.qwen3_6_27b_dense.vllm_adapter"
+
+# Weight upload of ~53 GiB and a set_program over the resident kernel can take
+# minutes on a loaded host; nothing here should time out before they finish.
+_TAPID_BIND_TIMEOUT_MS = 1_800_000
+_TAPID_PROGRAM_TIMEOUT_MS = 600_000
+_TAPID_FETCH_TIMEOUT_MS = 600_000
+
+# Pre-arm the fetch can block far longer than a decode step ever would; a
+# hung prefill surfaces as this timeout, not as a silent wedge.
+_TAPID_PREFILL_LOG_EVERY = 8
 
 
 def validate_tapid_config(runner: Any) -> None:
@@ -47,6 +72,21 @@ def validate_tapid_config(runner: Any) -> None:
         raise ValueError("TAPID P0/P1 does not support DBO")
     if runner.vllm_config.quant_config is not None:
         raise ValueError("TAPID P0/P1 does not support quantization")
+
+    adapter = runner.tapid_adapter
+    max_batched = int(runner.scheduler_config.max_num_batched_tokens)
+    if max_batched > adapter.MAX_PREFILL_TOKENS:
+        raise ValueError(
+            "TAPID prefill takes the whole prompt in one step; "
+            f"max_num_batched_tokens={max_batched} exceeds the kernel's row "
+            f"buffer of {adapter.MAX_PREFILL_TOKENS}"
+        )
+    if runner.model_config.max_model_len > adapter.MAX_PREFILL_TOKENS:
+        raise ValueError(
+            f"max_model_len={runner.model_config.max_model_len} cannot be "
+            f"prefilled in one step (kernel row buffer is "
+            f"{adapter.MAX_PREFILL_TOKENS}); lower max_model_len"
+        )
 
 
 _TORCH_SYNC_ORIGINALS: dict[str, Any] = {}
@@ -84,715 +124,395 @@ def _restore_device_sync() -> None:
             module.synchronize = original
 
 
-class _TapidModelRunnerBase:
-    """Shared TAPID setup for V1 and V2 model runners."""
+def _import_tapid_modules() -> tuple[Any, Any]:
+    try:
+        door = importlib.import_module(_TAPID_DOOR_MODULE)
+        adapter = importlib.import_module(_TAPID_ADAPTER_MODULE)
+    except ImportError as exc:
+        raise ImportError(
+            "TAPID integration requires $TAPID_REPO and $TAPID_REPO/python on "
+            "PYTHONPATH (run_e2e.sh sets both; see "
+            "gpu_daemon/docs/vllm_integration.md)"
+        ) from exc
+    return door, adapter
 
-    tapid: Any
-    tapid_config: dict[str, Any]
-    tapid_session: Any
-    tapid_hidden_output: torch.Tensor | None
-    tapid_attention_layers: tuple[str, ...]
-    tapid_gdn_layers: tuple[str, ...]
 
-    def _init_tapid_state(self, vllm_config: VllmConfig) -> None:
-        self.tapid_config = vllm_config.additional_config["tapid"]
-        self.tapid = importlib.import_module("tapid_vllm")
-        self.tapid_session = None
-        self.tapid_hidden_output = None
-        self.tapid_hidden_input = None
-        self.tapid_attention_layers = ()
-        self.tapid_gdn_layers = ()
-        self.tapid_runtime_bound = False
+class TapidGPUModelRunner(GPUModelRunner):
+    """V1 runner is not part of the prefill-only door.
+
+    gpu_worker selects this class when the V2 runner is off; constructing it
+    fails loudly instead of silently running the old two-copy integration.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        raise NotImplementedError(
+            "The TAPID prefill door only supports the V2 model runner; set "
+            "VLLM_USE_V2_MODEL_RUNNER=1 (run_e2e.sh does)."
+        )
+
+
+class TapidGPUModelRunnerV2(GPUModelRunnerV2):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        self.tapid_door, self.tapid_adapter = _import_tapid_modules()
+        validate_tapid_config(self)
+
+        self.tapid_session: Any = None
         self.tapid_armed = False
-        # TAPID does not write vLLM's KV / GDN caches yet, so decode after a
-        # TAPID-owned prefill reads uninitialized state. Verify mode runs both
-        # paths, logs the divergence, and returns vLLM's result.
-        self.tapid_verify = bool(self.tapid_config.get("verify", False))
-        # Probe mode installs a single-layer TAPID program and compares it
-        # against that one vLLM layer, attributing a divergence to GDN or to
-        # full attention instead of to the folded 64-layer cadence.
-        self.tapid_probe = str(self.tapid_config.get("probe", "full"))
-        self.tapid_probe_layer = int(self.tapid_config.get("probe_layer", 0))
-        self.tapid_state_audit = bool(self.tapid_config.get("state_audit", False))
-        self._probe_state_ref = None
-        self._probe_state_tensors = None
-        self._probe_state_names = None
-        self._probe_state_blocks = None
-        # Which engine actually ran each forward. TAPID takes prefill; decode
-        # stays on vLLM, so a healthy generation shows one TAPID step per
-        # request and one vLLM step per generated token.
+        # Keepalive: the host tensors the weight upload copied into TAPID's
+        # arena. Freed only when the session closes.
+        self._tapid_decoder_weights: Any = None
+        self._tapid_hidden_size = self.model_config.get_hidden_size()
+        self._tapid_next_request = 0
         self._tapid_steps = 0
-        self._vllm_steps = 0
 
-    def _report_tapid_divergence(
-        self, tapid_hidden: torch.Tensor, reference: torch.Tensor
-    ) -> None:
-        # Compared on the host on purpose. Launching further CUDA kernels after
-        # a full vLLM forward has run alongside the persistent kernel blocks
-        # inside cuLaunchKernel; a plain D2H copy of an already-drained tensor
-        # does not.
-        a = tapid_hidden.float()
-        b = reference[: a.shape[0]].float()
-        diff = (a - b).abs()
-        cosine = torch.nn.functional.cosine_similarity(
-            a.flatten(), b.flatten(), dim=0
+    # ---- model load: the single weight copy -------------------------------
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        # Always dummy-load, regardless of the caller's flag: the vLLM model
+        # keeps only the skeleton, so a full real load would transiently hold
+        # a second copy of the decoder that we would free again right after.
+        if not load_dummy_weights:
+            logger.info_once(
+                "TAPID: forcing dummy weight load; the decoder weights come "
+                "from TAPID's own upload and only the skeleton stays in vLLM"
+            )
+        super().load_model(True, *args, **kwargs)
+        self._load_tapid_skeleton()
+        self._free_decoder_weights()
+        self._bind_tapid_weights()
+
+    def _load_tapid_skeleton(self) -> None:
+        """Restore real values for embed / final norm / lm_head.
+
+        TAPID's submit takes token embeddings as its input (so vLLM embeds,
+        TAPID decodes); the program boundary is the decoder output (so vLLM
+        applies the final norm); and vLLM samples from lm_head. Names are the
+        checkpoint's own; the model's ``hf_to_vllm_mapper`` strips the VL-era
+        ``model.language_model.`` prefix.
+        """
+        skeleton = self.tapid_adapter.load_skeleton_tensors(
+            self.model_config.model
+        )
+        tied = bool(
+            getattr(self.model_config.hf_text_config, "tie_word_embeddings", False)
+        )
+        weights = {
+            name: tensor
+            for name, tensor in skeleton.items()
+            if not (tied and "lm_head" in name)
+        }
+        if not tied and not any("lm_head" in name for name in weights):
+            raise ValueError(
+                "lm_head is untied but the checkpoint skeleton has no "
+                "lm_head tensor; cannot sample without it"
+            )
+        loaded = self.model.load_weights(iter(weights.items()))
+        logger.info(
+            "TAPID: skeleton weights restored (%s), tied_lm_head=%s",
+            sorted(loaded or []), tied,
+        )
+
+    def _free_decoder_weights(self) -> None:
+        """Release every non-skeleton parameter back to the allocator.
+
+        The persistent-kernel program is the only consumer of the decoder
+        weights, so the vLLM copies are dead weight (~50 GiB). Params become
+        empty meta tensors: any accidental access fails loudly instead of
+        silently computing on dummy values.
+        """
+        skeleton_params = {
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        }
+        freed_bytes = 0
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if name in skeleton_params:
+                    continue
+                freed_bytes += param.numel() * param.element_size()
+                param.data = torch.empty(0, dtype=param.dtype, device="meta")
+        logger.info(
+            "TAPID: freed %.1f GiB of decoder parameters from the vLLM model",
+            freed_bytes / (1 << 30),
+        )
+
+    def _bind_tapid_weights(self) -> None:
+        """Convert the checkpoint once and upload it into TAPID's arena.
+
+        This happens inside load_model on purpose: the arena's device memory
+        is allocated before vLLM profiles free memory, so KV-cache sizing
+        automatically accounts for it. The adapter's layout conversions are
+        the same ones the TAPID st suite validates against reference outputs.
+        """
+        started = time.monotonic()
+        weights = self.tapid_adapter.load_decoder_weights(self.model_config.model)
+        # Keepalive for the host tensors the upload borrows.
+        self._tapid_decoder_weights = weights
+        self.tapid_session = self.tapid_door.TapidVllmSession([self.device.index])
+        self.tapid_session.bind_weights_from_host(
+            0, weights, timeout_ms=_TAPID_BIND_TIMEOUT_MS
         )
         logger.info(
-            "TAPID verify: rows=%d max|err|=%.6g mean|err|=%.6g "
-            "ref_rms=%.6g tapid_rms=%.6g cosine=%.6f",
-            a.shape[0],
-            float(diff.max()),
-            float(diff.mean()),
-            float(b.square().mean().sqrt()),
-            float(a.square().mean().sqrt()),
-            float(cosine),
+            "TAPID: %d decoder weights converted and uploaded (%.1f GiB, "
+            "%.1fs including conversion)",
+            len(weights),
+            self.tapid_adapter.arena_nbytes(weights) / (1 << 30),
+            time.monotonic() - started,
         )
-        # Row 0 attends only to itself and is the first GDN scan step, so a
-        # good row 0 with degrading later rows points at sequence mixing
-        # (attention / GDN scan) rather than the per-token path.
-        per_row = torch.nn.functional.cosine_similarity(a, b, dim=1)
-        logger.info(
-            "TAPID verify: per-row cosine=%s",
-            " ".join(f"{v:.4f}" for v in per_row.tolist()),
-        )
-        # The output buffer is zeroed before the run, so an all-zero row means
-        # TAPID never wrote it — a row-extent bug, not a numerical one.
-        logger.info(
-            "TAPID verify: per-row max|tapid|=%s",
-            " ".join(f"{v:.4g}" for v in a.abs().amax(dim=1).tolist()),
-        )
+        # Last kernel launches before the persistent kernel goes resident --
+        # a CUDA module loaded lazily *after* that never finishes loading.
+        self._warm_tapid_kernels()
 
-    def _report_tapid_state_divergence(self) -> None:
-        """Compare the GDN state TAPID wrote against vLLM's own.
+    # ---- kernel warmup -----------------------------------------------------
 
-        Hidden states matching is not enough for decode: decode reads the
-        recurrent/conv state, so a prefill that computes the right output but
-        leaves the state empty still generates garbage from the second token on.
-        """
-        if self._probe_state_ref is None or self._probe_state_tensors is None:
-            return
-        names = self._probe_state_names or ("gdn_conv", "gdn_recurrent")
-        tensors = self._probe_state_tensors
-        blocks = self._probe_state_blocks
-        if blocks is not None:
-            kv, blk = blocks
-            tensors = (kv[blk],)
-        for name, got, want in zip(names, tensors, self._probe_state_ref):
-            a = got.float().cpu()
-            b = want.float().cpu()
-            nz = int((a != 0).sum())
-            if nz == 0:
-                logger.info("TAPID state: %-14s NOT WRITTEN (all zero)", name)
-                continue
-            diff = (a - b).abs()
-            cos = torch.nn.functional.cosine_similarity(
-                a.flatten(), b.flatten(), dim=0
-            )
-            # Relative error against the local magnitude: max|err| alone cannot
-            # separate "one outlier element is wrong" from "a heavy tail of
-            # legitimately large values", and those need different fixes.
-            scale = b.abs().clamp_min(1e-6)
-            rel = (diff / scale)[b.abs() > b.abs().mean()]
-            q = torch.tensor([0.5, 0.9, 0.99, 1.0])
-            rq = torch.quantile(rel, q) if rel.numel() else torch.zeros(4)
-            logger.info(
-                "TAPID state: %-14s max|err|=%.6g ref_rms=%.6g tapid_rms=%.6g "
-                "cosine=%.6f nonzero=%d/%d rel[p50/p90/p99/max]=%.2e/%.2e/%.2e/%.2e",
-                name, float(diff.max()), float(b.square().mean().sqrt()),
-                float(a.square().mean().sqrt()), float(cos), nz, a.numel(),
-                *[float(v) for v in rq],
-            )
+    def _warm_tapid_kernels(self) -> None:
+        """Force every CUDA module the armed path may launch to load NOW.
 
-    def _audit_tapid_state(self, attention_metadata: Any, gdn_metadata: Any) -> None:
-        """Report which layers' caches the full 64-layer program actually wrote.
+        ``CUDA_MODULE_LOADING`` defaults to LAZY, so a module loads on its
+        first launch. TAPID's persistent kernels never exit, so a first launch
+        after they go resident blocks inside the driver forever. vLLM's own
+        warmup does not cover this runner's armed path, because the pre-arm
+        stub skips the pieces that only the armed path needs at every token
+        count.
 
-        The single-layer probes only ever exercise one layer_idx. If the folded
-        program mis-keys the runtime cache, every probe still passes while
-        decode reads empty state for most layers.
-        """
-        ctx_layers = self.vllm_config.compilation_config.static_forward_context
-        slots = attention_metadata.slot_mapping
-        blocks = sorted({int(v) // self.cache_config.block_size
-                         for v in slots.cpu().tolist()})
-        state_idx = int(gdn_metadata.non_spec_state_indices_tensor[0].item())
-
-        # Integer indexing gives a view, so .cpu() is a plain memcpy. Advanced
-        # indexing or a device-side .sum() would launch kernels, and launching
-        # those with the persistent kernel resident wedges the worker.
-        def host_nonzero(view) -> bool:
-            return bool(view.cpu().any())
-
-        empty_kv, empty_conv, empty_rec = [], [], []
-        for i, name in enumerate(self.tapid_attention_layers):
-            kv = ctx_layers[name].kv_cache
-            if isinstance(kv, (list, tuple)):
-                kv = kv[0]
-            if not any(host_nonzero(kv[b]) for b in blocks):
-                empty_kv.append(i)
-        for i, name in enumerate(self.tapid_gdn_layers):
-            conv, ssm = ctx_layers[name].kv_cache[0], ctx_layers[name].kv_cache[1]
-            if not host_nonzero(conv[state_idx]):
-                empty_conv.append(i)
-            if not host_nonzero(ssm[state_idx]):
-                empty_rec.append(i)
-        logger.info(
-            "TAPID audit: EMPTY kv=%s conv=%s recurrent=%s",
-            f"{len(empty_kv)}/{len(self.tapid_attention_layers)}",
-            f"{len(empty_conv)}/{len(self.tapid_gdn_layers)}",
-            f"{len(empty_rec)}/{len(self.tapid_gdn_layers)}",
-        )
-        return self._snapshot_state(blocks, state_idx)
-
-    def _snapshot_state(self, blocks, state_idx) -> dict:
-        """Host-side copy of every layer's caches (memcpy only, no kernels)."""
-        ctx_layers = self.vllm_config.compilation_config.static_forward_context
-        snap = {}
-        for i, name in enumerate(self.tapid_attention_layers):
-            kv = ctx_layers[name].kv_cache
-            if isinstance(kv, (list, tuple)):
-                kv = kv[0]
-            snap[("kv", i)] = torch.stack([kv[b].cpu() for b in blocks])
-        for i, name in enumerate(self.tapid_gdn_layers):
-            c, m = ctx_layers[name].kv_cache
-            snap[("conv", i)] = c[state_idx].cpu()
-            snap[("rec", i)] = m[state_idx].cpu()
-        return snap
-
-    def _compare_state_snapshots(self, got: dict, want: dict) -> None:
-        """Per-layer cache agreement, so a divergence can be pinned to a layer."""
-        for kind in ("kv", "conv", "rec"):
-            rows = []
-            for key in sorted(k for k in got if k[0] == kind):
-                a, b = got[key].float(), want[key].float()
-                cos = float(torch.nn.functional.cosine_similarity(
-                    a.flatten(), b.flatten(), dim=0))
-                rows.append((key[1], cos))
-            if not rows:
-                continue
-            bad = [i for i, c in rows if c < 0.99]
-            good = [c for _, c in rows if c >= 0.99]
-            logger.info(
-                "TAPID audit: %-4s layers=%d bad(<0.99)=%d %s | good_min=%.6f",
-                kind, len(rows), len(bad), bad,
-                min(good) if good else float("nan"),
-            )
-
-    def _tapid_text_model(self) -> Any:
-        candidate = getattr(self.model, "language_model", None) or self.model
-        return getattr(candidate, "model", None) or candidate
-
-    def _capture_tapid_probe_layer(self, model_inputs: dict[str, Any]) -> tuple:
-        """Run the vLLM model and capture one decoder layer's true hidden states.
-
-        vLLM fuses the residual add into the next layer's norm, so a layer takes
-        and returns ``(hidden, residual)`` and the actual hidden state at a layer
-        boundary is their sum. TAPID's probe consumes and produces that sum.
-
-        The capture deliberately happens before the persistent kernels start:
-        the tensor copies here are ordinary kernel launches, and launching those
-        after a full vLLM forward has run alongside a resident persistent kernel
-        blocks in ``cuLaunchKernel``.
-        """
-        text_model = self._tapid_text_model()
-        captured: dict[str, torch.Tensor] = {}
-
-        def hook(module, args, kwargs, output):
-            hidden = kwargs.get("hidden_states", args[0] if args else None)
-            residual = kwargs.get(
-                "residual", args[1] if len(args) > 1 else None
-            )
-            captured["input"] = hidden if residual is None else hidden + residual
-            captured["output"] = output[0] + output[1]
-
-        handle = text_model.layers[self.tapid_probe_layer].register_forward_hook(
-            hook, with_kwargs=True
-        )
-        try:
-            reference = super()._model_forward(**model_inputs)
-        finally:
-            handle.remove()
-
-        # The GDN state caches this layer owns, so the probe can check what TAPID
-        # wrote into them against what vLLM's own kernels wrote.
-        self._probe_state_ref = None
-        self._probe_state_tensors = None
-        self._probe_state_names = None
-        self._probe_state_blocks = None
-        if self.tapid_probe == "attention":
-            ctx_layers = self.vllm_config.compilation_config.static_forward_context
-            suffix = f".layers.{self.tapid_probe_layer}.self_attn.attn"
-            name = next(
-                (n for n in self.tapid_attention_layers if n.endswith(suffix)), None
-            )
-            entry = ctx_layers.get(name) if name else None
-            kv = getattr(entry, "kv_cache", None) if entry is not None else None
-            if isinstance(kv, (list, tuple)):
-                kv = kv[0]
-            attn_md = get_forward_context().attn_metadata.get(name)
-            slots = getattr(attn_md, "slot_mapping", None)
-            if kv is not None and slots is not None and slots.numel() > 0:
-                logger.info(
-                    "TAPID state: kv_cache shape=%s stride=%s dtype=%s slots=%s",
-                    tuple(kv.shape), tuple(kv.stride()), kv.dtype,
-                    slots[: min(8, slots.numel())].tolist(),
-                )
-                # Only the blocks this request touches.
-                blk = torch.unique(slots // self.cache_config.block_size)
-                self._probe_state_tensors = (kv[blk],)
-                self._probe_state_ref = (kv[blk].clone(),)
-                kv[blk] = 0
-                self._probe_state_names = ("attn_kv",)
-                self._probe_state_blocks = (kv, blk)
-
-        if self.tapid_probe == "gdn":
-            ctx_layers = self.vllm_config.compilation_config.static_forward_context
-            suffix = f".layers.{self.tapid_probe_layer}.linear_attn"
-            name = next(
-                (n for n in self.tapid_gdn_layers if n.endswith(suffix)), None
-            )
-            entry = ctx_layers.get(name) if name else None
-            gdn_md = get_forward_context().attn_metadata.get(name)
-            idx_t = getattr(gdn_md, "non_spec_state_indices_tensor", None)
-            if entry is not None and getattr(entry, "kv_cache", None) and (
-                idx_t is not None and idx_t.numel() > 0
-            ):
-                # Only the slot this request uses: the full ssm_state is
-                # [num_slots, 48, 128, 128] fp32 (~3 MiB per slot), and copying
-                # all of it back is slow enough that shutdown kills the probe.
-                slot = int(idx_t[0].item())
-                conv = entry.kv_cache[0][slot]
-                ssm = entry.kv_cache[1][slot]
-                self._probe_state_tensors = (conv, ssm)
-                self._probe_state_ref = (conv.clone(), ssm.clone())
-                self._probe_state_names = ("gdn_conv", "gdn_recurrent")
-                conv.zero_()
-                ssm.zero_()
-
-        layer = text_model.layers[self.tapid_probe_layer]
-        if self.tapid_probe == "mlp":
-            # The control: no mixer, so TAPID runs only the layer's MLP block
-            # over the same input the mixer would have seen.
-            hidden = captured["input"]
-            normed = layer.post_attention_layernorm(hidden)
-            if isinstance(normed, tuple):
-                normed = normed[0]
-            expected_hidden = hidden + layer.mlp(normed)
-        else:
-            expected_hidden = captured["output"]
-
-        expected = text_model.norm(expected_hidden)
-        if isinstance(expected, tuple):
-            expected = expected[0]
-        # clone(), not contiguous(): the captured tensor can be one of vLLM's
-        # reused activation buffers, and TAPID reads it long after the forward
-        # that produced it has moved on.
-        probe_input = captured["input"].to(torch.bfloat16).clone()
-        return reference, probe_input, expected.cpu()
-
-    def tapid_arm(self) -> None:
-        """Hand steady-state prefill over to TAPID (called after vLLM warmup)."""
-        self.tapid_armed = True
-
-    def _bind_tapid_runtime(self) -> None:
-        assert self.tapid_session is not None
-        self.tapid_session.bind_runtime(
-            build_runtime_bindings(
-                self,
-                self.tapid,
-                self.tapid_attention_layers,
-                self.tapid_gdn_layers,
-            )
-        )
-        self.tapid_runtime_bound = True
-
-    def _tapid_owns_step(self) -> bool:
-        """True when this forward is a step TAPID can run.
-
-        Pure prefill and pure decode both qualify: they are the same 129-step
-        traversal, differing only in how many rows enter it and whether the
-        mixers seed themselves from the caches. Everything else — profiling /
-        dummy runs before ``bind_runtime``, all-padding batches, mixed
-        prefill+decode batches, spec decode — stays on the vLLM model. The
-        check must run *before* ``_ensure_tapid_started`` so the persistent
-        kernels are never launched for a step vLLM will execute.
-        """
-        if (
-            self.tapid_session is None
-            or not self.tapid_runtime_bound
-            or not self.tapid_armed
-        ):
-            return False
-        context = get_forward_context()
-        if not isinstance(context.attn_metadata, dict):
-            return False
-        gdn_metadata = context.attn_metadata.get(self.tapid_gdn_layers[0])
-        attention_metadata = context.attn_metadata.get(self.tapid_attention_layers[0])
-        if gdn_metadata is None or attention_metadata is None:
-            return False
-        if context.is_padding is not None and bool(context.is_padding.any()):
-            return False
-        # The GDN state write-back keys everything off request 0, and the scan
-        # does not reset at request boundaries, so a batch carrying more than
-        # one request would be silently wrong rather than merely unsupported.
-        indices = gdn_metadata.non_spec_state_indices_tensor
-        if indices is None or indices.numel() != 1:
-            return False
-        if gdn_metadata.num_spec_decodes != 0:
-            return False
-        # A mixed batch would need both shapes in one traversal, and the
-        # write-backs still key off request 0, so it stays on vLLM.
-        if gdn_metadata.num_prefills != 0 and gdn_metadata.num_decodes != 0:
-            return False
-        # Verify mode re-runs the step on vLLM and returns vLLM's result. For a
-        # prefill that is harmless (both write the same slots), but a decode
-        # would advance the GDN recurrence twice. Compare decode with
-        # cmp_tokens.py instead.
-        if self.tapid_verify and gdn_metadata.num_decodes != 0:
-            return False
-        return gdn_metadata.num_prefills + gdn_metadata.num_decodes > 0
-
-    def _warm_lazy_cuda_kernels(self) -> None:
-        """Force every embedding kernel vLLM may launch to load NOW.
-
-        ``CUDA_MODULE_LOADING`` defaults to LAZY, so a CUDA function's module is
-        loaded on its *first* launch. TAPID's persistent kernels never exit, so
-        a load that first happens after they go resident never completes:
-        ``cuLaunchKernel`` blocks inside the driver forever, and the engine
-        hangs with no error.
-
-        This was measured, not guessed. A 6-token prompt followed by a 35-token
-        one hung in ``F.embedding``'s ``index_select``; two prompts of the *same*
-        length were fine, and so were two long ones. The token count is what
-        picks the kernel specialisation, so only a length that had never been
-        embedded before could hang. vLLM's own warmup does not cover this,
-        because it does not embed token ids at a spread of lengths.
-
-        Sweeping the count here loads every specialisation up front.
-        ``CUDA_MODULE_LOADING=EAGER`` fixes it too, but it loads all of
-        libtorch_cuda's modules and costs minutes of startup.
-
-        ponytail: covers the embedding only. It is the one op whose shape still
-        varies per request after this point -- everything downstream of
-        _model_forward runs on num_reqs or fixed sizes. A future op that
-        dispatches on a new shape would need adding here.
+        The token count picks the embedding's kernel specialisation, so the
+        sweep must cover the lengths the engine can submit (measured, not
+        guessed: a 6-token prompt after a 35-token one once hung inside
+        F.embedding's index_select). Everything else (casts, copies, the final
+        norm) dispatches independently of token count, but sweeping costs
+        nothing extra here.
         """
         embed = getattr(self.model, "embed_input_ids", None)
         if embed is None:
-            return
+            raise RuntimeError(
+                "TAPID requires the model to expose embed_input_ids"
+            )
         max_tokens = int(self.scheduler_config.max_num_batched_tokens)
         counts = {1, max_tokens}
         n = 2
         while n < max_tokens:
             counts.add(n)
             n *= 2
+        text_norm = self._tapid_text_model().norm
         for count in sorted(counts):
-            # No sync afterwards: the lazy load happens inside the launch call
-            # itself -- that is exactly why cuLaunchKernel is where it blocks --
-            # so the module is resident once this returns.
-            embed(torch.zeros(count, dtype=torch.int32, device=self.device))
+            ids = torch.zeros(count, dtype=torch.int32, device=self.device)
+            hidden = embed(ids)
+            # Exactly the staging ops the armed path performs, dispatch-for-
+            # dispatch: bf16->F32 cast folded into the D2H copy, then H2D copy
+            # with the cast back to BF16, then the final norm.
+            staged = hidden.to("cpu", dtype=torch.float32)
+            dev = staged.to(self.device, dtype=self.model_config.dtype)
+            text_norm(dev)
         logger.info(
-            "TAPID: preloaded embedding kernels for %d token counts", len(counts)
+            "TAPID: preloaded embed/stage/norm kernels for %d token counts",
+            len(counts),
         )
 
-    def _ensure_tapid_started(self) -> None:
-        assert self.tapid_session is not None
-        if not self.tapid_session.ready:
-            self._warm_lazy_cuda_kernels()
-            _install_stream_only_sync(self.device)
-            self.tapid_session.start()
+    # ---- arming ------------------------------------------------------------
 
-    def _allocate_tapid_hidden_output(self) -> None:
-        hidden_size = self.model_config.get_hidden_size()
-        rows = self.scheduler_config.max_num_batched_tokens
-        self.tapid_hidden_output = torch.zeros(
-            (rows, hidden_size), dtype=self.model_config.dtype, device=self.device
+    def tapid_arm(self) -> None:
+        """Hand steady-state prefill over to TAPID (called after vLLM warmup).
+
+        Warmup is full of device-wide syncs, so the persistent kernels only go
+        resident here. After this point every sync in the process must be a
+        stream sync — installed before the launch, not after.
+        """
+        if self.tapid_session is None:
+            return
+        _install_stream_only_sync(self.device)
+        started = time.monotonic()
+        self.tapid_session.launch()
+        # Same settle window the bench runner uses: the resident CTAs come up
+        # before the program is swapped in.
+        time.sleep(0.3)
+        payload = self.tapid_adapter.decoder_program_payload(
+            self.tapid_session.abi
         )
-        # The input is the SOP source, and every stage reads its operands at
-        # that one row stride, so it must be padded to the work slabs'
-        # capacity. The output is only ever written by the terminal at its own
-        # stride, so it stays contiguous.
-        stride = self.tapid.HIDDEN_ROW_STRIDE
-        assert hidden_size <= stride
-        self.tapid_hidden_input = torch.zeros(
-            (rows, stride), dtype=self.model_config.dtype, device=self.device
-        )[:, :hidden_size]
+        self.tapid_session.set_program(
+            payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
+        )
+        self.tapid_armed = True
+        logger.info(
+            "TAPID armed: persistent prefill program resident (%.1fs)",
+            time.monotonic() - started,
+        )
 
-    def _to_tapid_hidden_input(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Stage vLLM's contiguous activations into the padded input buffer."""
-        assert self.tapid_hidden_input is not None
-        staged = self.tapid_hidden_input[: hidden.shape[0]]
-        staged.copy_(hidden)
-        return staged
+    # ---- forwards ----------------------------------------------------------
+
+    def _model_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: Any,
+    ) -> Any:
+        if not self.tapid_armed:
+            return self._stub_forward(input_ids, inputs_embeds)
+        return self._tapid_prefill_forward(input_ids, inputs_embeds)
+
+    def _stub_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> Any:
+        """Pre-arm stand-in for the model body: embed -> final norm.
+
+        Runs for every profile/dummy/warmup step, so the kernels it needs load
+        before the persistent kernel goes resident. It touches only skeleton
+        weights — the decoder parameters are already meta-empty, which is safe
+        precisely because this stub never walks the layers.
+        """
+        if inputs_embeds is not None:
+            hidden = inputs_embeds
+        elif input_ids is not None:
+            hidden = self.model.embed_input_ids(input_ids)
+        else:
+            raise RuntimeError(
+                "TAPID stub forward requires token ids or input embeddings"
+            )
+        normed = self._tapid_text_model().norm(hidden)
+        if isinstance(normed, tuple):
+            normed = normed[0]
+        return normed.to(self.model_config.dtype)
+
+    def _prefill_batch(self) -> tuple[int, Any]:
+        """Validate the scheduled batch is one fresh prefill; return (rows, md).
+
+        Everything comes from the forward context's attention metadata as
+        host-side reads (``query_start_loc.cpu()`` and ``.item()`` are plain
+        memcpys) — no kernel launches, which are the dangerous ones once the
+        persistent kernel is resident.
+        """
+        context = get_forward_context()
+        metadata_map = context.attn_metadata
+        if not isinstance(metadata_map, dict):
+            raise RuntimeError(
+                "TAPID prefill expects the hybrid attention metadata dict"
+            )
+        batch_md = None
+        for key, value in metadata_map.items():
+            if key.endswith(".self_attn.attn"):
+                batch_md = value
+                break
+            if batch_md is None and getattr(value, "query_start_loc", None) is not None:
+                batch_md = value
+        if batch_md is None:
+            raise RuntimeError(
+                "TAPID prefill could not find query_start_loc in the "
+                "attention metadata"
+            )
+
+        if int(getattr(batch_md, "num_spec_decodes", 0) or 0) != 0:
+            raise RuntimeError("TAPID prefill does not support speculative decode")
+        for value in metadata_map.values():
+            if int(getattr(value, "num_spec_decodes", 0) or 0) != 0:
+                raise RuntimeError(
+                    "TAPID prefill does not support speculative decode"
+                )
+
+        query_start_loc = batch_md.query_start_loc.cpu()
+        num_reqs = query_start_loc.numel() - 1
+        if num_reqs != 1:
+            raise RuntimeError(
+                f"TAPID prefill runs exactly one request per step, got "
+                f"{num_reqs}; run with --max-num-seqs 1 and one request at a "
+                f"time"
+            )
+        rows = int(query_start_loc[-1].item())
+        query_len = int(query_start_loc[1].item()) - int(query_start_loc[0].item())
+        seq_len = int(batch_md.seq_lens[0].item())
+        computed = seq_len - query_len
+        if computed != 0:
+            hint = (
+                "decode step"
+                if query_len == 1
+                else "chunked prefill (run with --max-num-batched-tokens >= "
+                "--max-model-len to prefill in one step)"
+            )
+            raise RuntimeError(
+                f"TAPID prefill cannot continue a sequence ({hint}; "
+                f"{computed} tokens already computed). Decode is out of scope: "
+                f"use --max-tokens 1 to measure prefill only."
+            )
+        return rows, batch_md
+
+    def _tapid_prefill_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> Any:
+        rows, _batch_md = self._prefill_batch()
+        if rows <= 0 or rows > self.tapid_adapter.MAX_PREFILL_TOKENS:
+            raise RuntimeError(
+                f"TAPID prefill row count {rows} outside (0, "
+                f"{self.tapid_adapter.MAX_PREFILL_TOKENS}]"
+            )
+        if inputs_embeds is not None:
+            hidden = inputs_embeds
+        elif input_ids is not None:
+            hidden = self.model.embed_input_ids(input_ids)
+        else:
+            raise RuntimeError(
+                "TAPID prefill requires token ids or input embeddings"
+            )
+        if hidden.shape[0] < rows or hidden.shape[1] != self._tapid_hidden_size:
+            raise RuntimeError(
+                f"embedded hidden {tuple(hidden.shape)} cannot carry {rows} "
+                f"rows of width {self._tapid_hidden_size}"
+            )
+
+        request_id = self._tapid_next_request
+        self._tapid_next_request += 1
+        self.tapid_session.submit_hidden(
+            request_id, hidden[:rows], self._tapid_hidden_size
+        )
+        out_flat, out_rows, out_cols = self.tapid_session.fetch_array(
+            request_id,
+            rows * self._tapid_hidden_size,
+            timeout_ms=_TAPID_FETCH_TIMEOUT_MS,
+        )
+        if (out_rows, out_cols) != (rows, self._tapid_hidden_size):
+            raise RuntimeError(
+                f"TAPID returned {out_rows}x{out_cols}, expected "
+                f"{rows}x{self._tapid_hidden_size}"
+            )
+
+        # Writable numpy view over the fetch buffer -> device BF16 -> final
+        # norm. Every module here was loaded by _warm_tapid_kernels; from_numpy
+        # and the copies themselves launch no lazily-loaded kernels.
+        out = torch.from_numpy(
+            np.asarray(out_flat).reshape(out_rows, out_cols)
+        ).to(self.device, dtype=self.model_config.dtype)
+        normed = self._tapid_text_model().norm(out)
+        if isinstance(normed, tuple):
+            normed = normed[0]
+
+        self._tapid_steps += 1
+        if self._tapid_steps % _TAPID_PREFILL_LOG_EVERY == 1:
+            logger.info(
+                "TAPID prefill #%d: rows=%d request_id=%#x",
+                self._tapid_steps, rows, request_id,
+            )
+        return normed
+
+    def _tapid_text_model(self) -> Any:
+        candidate = getattr(self.model, "language_model", None) or self.model
+        return getattr(candidate, "model", None) or candidate
+
+    # ---- shutdown ----------------------------------------------------------
 
     def _close_tapid_session(self) -> None:
         self.tapid_armed = False
         if self.tapid_session is not None:
+            # close() stops the persistent kernels, so a real device sync is
+            # legal again — and vLLM's own shutdown path needs one.
             self.tapid_session.close()
             self.tapid_session = None
-        # Close() stops the persistent kernels, so a real device sync is legal
-        # again — and vLLM's own shutdown path needs one.
         _restore_device_sync()
-        self.tapid_hidden_output = None
-        self.tapid_hidden_input = None
-
-
-class TapidGPUModelRunner(_TapidModelRunnerBase, GPUModelRunner):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
-        self._validate_config()
-        self._init_tapid_state(vllm_config)
-
-    def _validate_config(self) -> None:
-        validate_tapid_config(self)
-
-    def load_model(self, load_dummy_weights: bool = False) -> None:
-        super().load_model(load_dummy_weights)
-        self.tapid_attention_layers, self.tapid_gdn_layers = get_qwen_layer_names(
-            self.vllm_config
-        )
-        self.tapid_session = self.tapid.Session(
-            device=self.device.index,
-            model_signature=self.tapid_config["model_signature"],
-            program=self.tapid_probe,
-            layer=self.tapid_probe_layer,
-        )
-        self.tapid_session.bind_weights(build_weight_bindings(self.model, self.tapid))
-        self.tapid_session.reserve_workspace(
-            max_num_tokens=self.scheduler_config.max_num_batched_tokens,
-            max_num_requests=self.scheduler_config.max_num_seqs,
-        )
-        self._allocate_tapid_hidden_output()
-
-    def initialize_kv_cache(
-        self,
-        kv_cache_config: KVCacheConfig,
-        is_profiling: bool = False,
-    ) -> None:
-        super().initialize_kv_cache(kv_cache_config, is_profiling)
-        if not is_profiling:
-            self._bind_tapid_runtime()
-
-    def _model_forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
-    ) -> Any:
-        if self.tapid_session is None:
-            raise self.tapid.TapidConfigError(
-                "TAPID session is not ready for online forward"
-            )
-        # Start the persistent runtime lazily, after vLLM warmup has compiled
-        # its Triton kernels (device-wide sync deadlocks against persistent
-        # kernels, so they must not be resident during warmup).
-        self._ensure_tapid_started()
-        if positions is None:
-            raise self.tapid.TapidConfigError("TAPID P0/P1 requires positions")
-        if inputs_embeds is not None:
-            hidden_input = inputs_embeds
-        elif input_ids is not None:
-            hidden_input = self.model.embed_input_ids(input_ids)
-        else:
-            raise self.tapid.TapidConfigError(
-                "TAPID P0/P1 requires token IDs or input embeddings"
-            )
-
-        hidden_input = self._to_tapid_hidden_input(hidden_input)
-        step = build_prefill_step(
-            self,
-            self.tapid,
-            self.tapid_attention_layers[0],
-            self.tapid_gdn_layers[0],
-            hidden_input,
-            positions,
-        )
-        stream = torch.cuda.current_stream(self.device)
-        return self.tapid_session.run_prefill(step, stream=stream)
-
-    def shutdown(self) -> None:
-        self._close_tapid_session()
-        super().shutdown()
-
-
-class TapidGPUModelRunnerV2(_TapidModelRunnerBase, GPUModelRunnerV2):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
-        self._validate_config()
-        self._init_tapid_state(vllm_config)
-
-    def _validate_config(self) -> None:
-        validate_tapid_config(self)
-
-    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
-        super().load_model(load_dummy_weights, *args, **kwargs)
-        self.tapid_attention_layers, self.tapid_gdn_layers = get_qwen_layer_names(
-            self.vllm_config
-        )
-        self.tapid_session = self.tapid.Session(
-            device=self.device.index,
-            model_signature=self.tapid_config["model_signature"],
-            program=self.tapid_probe,
-            layer=self.tapid_probe_layer,
-        )
-        self.tapid_session.bind_weights(build_weight_bindings(self.model, self.tapid))
-        self.tapid_session.reserve_workspace(
-            max_num_tokens=self.scheduler_config.max_num_batched_tokens,
-            max_num_requests=self.scheduler_config.max_num_seqs,
-        )
-        self._allocate_tapid_hidden_output()
-
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        super().initialize_kv_cache(kv_cache_config)
-        self._bind_tapid_runtime()
-
-    def _model_forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
-    ) -> Any:
-        if not self._tapid_owns_step():
-            self._vllm_steps += 1
-            return super()._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
-        self._tapid_steps += 1
-        context = get_forward_context()
-        assert isinstance(context.attn_metadata, dict)
-        attention_metadata = context.attn_metadata[self.tapid_attention_layers[0]]
-        gdn_metadata = context.attn_metadata[self.tapid_gdn_layers[0]]
-        logger.info(
-            "TAPID owns this forward (%s): tapid_steps=%d vllm_steps=%d",
-            "decode" if gdn_metadata.num_decodes else "prefill",
-            self._tapid_steps, self._vllm_steps,
-        )
-
-        model_inputs = {
-            "input_ids": input_ids,
-            "positions": positions,
-            "intermediate_tensors": intermediate_tensors,
-            "inputs_embeds": inputs_embeds,
-            **model_kwargs,
-        }
-        probe_expected = None
-        if self.tapid_probe != "full":
-            reference, hidden_input, probe_expected = (
-                self._capture_tapid_probe_layer(model_inputs)
-            )
-
-        if positions is None:
-            raise self.tapid.TapidConfigError("TAPID P0/P1 requires positions")
-        if probe_expected is not None:
-            pass
-        elif inputs_embeds is not None:
-            hidden_input = inputs_embeds
-        elif input_ids is not None:
-            hidden_input = self.model.embed_input_ids(input_ids)
-        else:
-            raise self.tapid.TapidConfigError(
-                "TAPID P0/P1 requires token IDs or input embeddings"
-            )
-        # Staged before the runtime starts: this is a plain kernel launch, and
-        # they are only reliable while the persistent kernels are not resident.
-        hidden_input = self._to_tapid_hidden_input(hidden_input)
-
-        step = build_v2_prefill_step(
-            self,
-            self.tapid,
-            attention_metadata,
-            gdn_metadata,
-            hidden_input,
-            positions,
-            build_gdn_state_index_by_layer(
-                self.tapid_gdn_layers, context.attn_metadata, self.device
-            ),
-        )
-
-        # Start the persistent runtime lazily, and only once a step is really
-        # TAPID's: the kernels stay resident for the process lifetime and any
-        # device-wide sync after that point deadlocks against them. Building the
-        # step first keeps its tensor work on the pre-resident side.
-        self._ensure_tapid_started()
-        stream = torch.cuda.current_stream(self.device)
-        if probe_expected is not None:
-            # Zeroed so an unwritten output row is distinguishable from a
-            # wrongly-computed one.
-            self.tapid_hidden_output.zero_()
-        tapid_hidden = self.tapid_session.run_prefill(step, stream=stream)
-
-        if probe_expected is not None:
-            stream.synchronize()
-            logger.info(
-                "TAPID probe: program=%s layer=%d",
-                self.tapid_probe,
-                self.tapid_probe_layer,
-            )
-            self._report_tapid_divergence(tapid_hidden.cpu(), probe_expected)
-            self._report_tapid_state_divergence()
-            return reference
-
-        # Prefill only: the audit re-runs the same step on vLLM to get a
-        # reference, which for decode would advance state TAPID has already
-        # advanced and compare a step against its own successor. Token equality
-        # (cmp_tokens.py) is the decode-side check.
-        if self.tapid_state_audit and not gdn_metadata.num_decodes:
-            stream.synchronize()
-            tapid_state = self._audit_tapid_state(attention_metadata, gdn_metadata)
-            blocks = sorted({int(v) // self.cache_config.block_size
-                             for v in attention_metadata.slot_mapping.cpu().tolist()})
-            sidx = int(gdn_metadata.non_spec_state_indices_tensor[0].item())
-            # vLLM writes the same slots, so no clearing is needed first.
-            super()._model_forward(
-                input_ids=input_ids, positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds, **model_kwargs,
-            )
-            stream.synchronize()
-            self._compare_state_snapshots(
-                tapid_state, self._snapshot_state(blocks, sidx)
-            )
-
-        if not self.tapid_verify:
-            return tapid_hidden
-
-        # Verify mode: run the same step on the vLLM model and report the
-        # divergence. vLLM's result is what gets returned, because it is also
-        # what populates the KV / GDN caches that decode reads — TAPID does not
-        # write them yet.
-        #
-        # Each phase is drained separately: with a persistent kernel resident,
-        # a stall could be TAPID's or vLLM's, and one fused sync at the end
-        # cannot say which.
-        started = time.monotonic()
-        stream.synchronize()
-        logger.info(
-            "TAPID verify: prefill drained in %.1fs", time.monotonic() - started
-        )
-
-        tapid_cpu = tapid_hidden.cpu()
-        started = time.monotonic()
-        reference = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
-        stream.synchronize()
-        logger.info(
-            "TAPID verify: vLLM reference drained in %.1fs",
-            time.monotonic() - started,
-        )
-        self._report_tapid_divergence(tapid_cpu, reference.cpu())
-        return reference
+        self._tapid_decoder_weights = None
 
     def shutdown(self) -> None:
         self._close_tapid_session()
