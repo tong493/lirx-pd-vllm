@@ -130,12 +130,9 @@ def _install_spin_wait_output_event() -> None:
 
     The engine waits on ``torch.cuda.Event(blocking=True)`` (the
     cudaEventBlockingSync flavor: the host thread sleeps on a driver
-    interrupt) for the async D2H output copy. py-spy has pinned the sampling
-    hang to exactly that wait. Diagnostic and candidate fix in one: a
-    spin-wait event polls the GPU-side completion instead. If the hang
-    disappears, the blocking wait never waking under the resident persistent
-    kernel was the problem; if it survives, the copy itself never executes
-    and the next probe has to chase the copy stream.
+    interrupt) for the async D2H output copy. A spin-wait event polls the
+    GPU-side completion instead, avoiding any host-side sleep primitive that
+    might interact badly with the resident persistent kernel.
     """
     import vllm.v1.worker.gpu.async_utils as async_utils_mod
 
@@ -149,10 +146,6 @@ def _install_spin_wait_output_event() -> None:
                 event_kwargs.pop("blocking", None)
                 super().__init__(*event_args, **event_kwargs)
 
-        # TEMP-DIAG(TAPID): the stream() context has already switched the
-        # current stream to the copy stream here — capture it so the runner
-        # can drain it directly and prove whether the D2H output copies run.
-        self._tapid_copy_stream = torch.cuda.current_stream()
         torch.cuda.Event = _SpinEvent
         try:
             original_init(self, *args, **kwargs)
@@ -429,109 +422,18 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # Same settle window the bench runner uses: the resident CTAs come up
         # before the program is swapped in.
         time.sleep(0.3)
-        logger.info(
-            "TAPID: launch returned in %.2fs; probing device before "
-            "set_program",
-            time.monotonic() - started,
-        )
-        self._log_gpu_probe()
-        self._start_probe_thread()
+        logger.info("TAPID: launch returned in %.2fs", time.monotonic() - started)
         payload = self.tapid_adapter.decoder_program_payload(
             self.tapid_session.abi
         )
         self.tapid_session.set_program(
             payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
         )
-        self._stop_probe_thread()
         self.tapid_armed = True
         logger.info(
             "TAPID armed: persistent prefill program resident (%.1fs)",
             time.monotonic() - started,
         )
-
-    def _gpu_state_lines(self) -> list[str]:
-        """Whole-machine GPU table + compute-app list, joined by GPU UUID.
-
-        A single ``nvidia-smi -i <index>`` is ambiguous under
-        CUDA_VISIBLE_DEVICES (torch's device 0 is whichever physical GPU the
-        env picked), so log every card and the process list instead: the UUID
-        column ties the process table to the util table, and the PID column
-        finds our own footprint.
-        """
-        import os
-        import subprocess
-
-        def _smi(query_args: list[str]) -> str:
-            probe = subprocess.run(
-                ["nvidia-smi", *query_args, "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            return probe.stdout.strip() or probe.stderr.strip()
-
-        try:
-            lines = [
-                f"TAPID: pid={os.getpid()} CUDA_VISIBLE_DEVICES="
-                f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
-                "TAPID: per-GPU (index, uuid, util, mem used/total):",
-                *[
-                    "  " + line
-                    for line in _smi(
-                        [
-                            "--query-gpu=index,gpu_uuid,utilization.gpu,"
-                            "memory.used,memory.total"
-                        ]
-                    ).splitlines()
-                ],
-                "TAPID: compute apps (uuid, pid, mem):",
-                *[
-                    "  " + line
-                    for line in _smi(
-                        ["--query-compute-apps=gpu_uuid,pid,used_memory"]
-                    ).splitlines()
-                ],
-            ]
-        except Exception as exc:
-            lines = [f"TAPID: GPU probe unavailable: {exc}"]
-        return lines
-
-    def _log_gpu_probe(self) -> None:
-        """Log device state from outside the process.
-
-        ~100% util on OUR gpu means the persistent kernel went resident and
-        is spinning; 0% means the launch never took. Reads via nvidia-smi so
-        no CUDA call of our own can perturb the state being observed.
-        """
-        for line in self._gpu_state_lines():
-            logger.info("%s", line)
-
-    def _start_probe_thread(self) -> None:
-        """Sample the whole-machine GPU state every 20s while set_program
-        blocks.
-
-        If the device-ack hang is the kernel spinning without consuming the
-        host command, our GPU's samples say ~100%; if the launch never took,
-        0%. The whole table (not a single card) because the process-to-GPU
-        mapping under CUDA_VISIBLE_DEVICES is easy to get wrong.
-        """
-        import threading
-
-        stop = threading.Event()
-
-        def _sample() -> None:
-            while not stop.wait(20):
-                for line in self._gpu_state_lines():
-                    logger.info("TAPID: set_program pending | %s", line)
-
-        self._probe_stop = stop
-        threading.Thread(target=_sample, daemon=True).start()
-
-    def _stop_probe_thread(self) -> None:
-        stop = getattr(self, "_probe_stop", None)
-        if stop is not None:
-            stop.set()
-            self._probe_stop = None
 
     # ---- forwards ----------------------------------------------------------
     def _model_forward(
@@ -707,26 +609,6 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     def _tapid_text_model(self) -> Any:
         candidate = getattr(self.model, "language_model", None) or self.model
         return getattr(candidate, "model", None) or candidate
-
-    def sample_tokens(self, grammar_output: Any = None) -> Any:
-        """Diagnostic wrapper: prove the sampler-era kernels executed.
-
-        The post-prefill hang sits in the engine's wait for the async output
-        copy, one step AFTER this method returns. A stream-scoped drain here
-        splits the space: if this log prints, everything enqueued on the main
-        stream through the sampler actually ran on the device and the freeze
-        is in the copy/event machinery; if not, a sampler-era kernel is the
-        one that never executes.
-        """
-        output = super().sample_tokens(grammar_output)
-        if self.tapid_armed:
-            torch.cuda.current_stream().synchronize()
-            logger.info("TAPID: post-sample main stream drained")
-            copy_stream = getattr(output, "_tapid_copy_stream", None)
-            if copy_stream is not None:
-                copy_stream.synchronize()
-                logger.info("TAPID: output copy stream drained")
-        return output
 
     # ---- shutdown ----------------------------------------------------------
 
