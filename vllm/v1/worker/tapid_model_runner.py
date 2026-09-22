@@ -149,6 +149,10 @@ def _install_spin_wait_output_event() -> None:
                 event_kwargs.pop("blocking", None)
                 super().__init__(*event_args, **event_kwargs)
 
+        # TEMP-DIAG(TAPID): the stream() context has already switched the
+        # current stream to the copy stream here — capture it so the runner
+        # can drain it directly and prove whether the D2H output copies run.
+        self._tapid_copy_stream = torch.cuda.current_stream()
         torch.cuda.Event = _SpinEvent
         try:
             original_init(self, *args, **kwargs)
@@ -692,6 +696,10 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         if self.tapid_armed:
             torch.cuda.current_stream().synchronize()
             logger.info("TAPID: post-sample main stream drained")
+            copy_stream = getattr(output, "_tapid_copy_stream", None)
+            if copy_stream is not None:
+                copy_stream.synchronize()
+                logger.info("TAPID: output copy stream drained")
         return output
 
     # ---- shutdown ----------------------------------------------------------

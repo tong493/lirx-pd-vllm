@@ -1319,6 +1319,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        # TEMP-DIAG(TAPID): bisect the post-prefill sampling freeze.
+        torch.cuda.current_stream().synchronize()
+        logger.info("TAPID-DIAG: logits computed, main stream drained")
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1732,6 +1735,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
         )
+
+        # TEMP-DIAG(TAPID): bisect the post-prefill sampling freeze. Remove
+        # once the frozen op is identified.
+        torch.cuda.current_stream().synchronize()
+        logger.info("TAPID-DIAG: sample_tokens entry, main stream drained")
 
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
