@@ -12,6 +12,15 @@ import argparse
 import os
 import sys
 
+# Eagerly load every CUDA module at context creation, before the TAPID
+# persistent kernel goes resident. Under the default LAZY loading, the first
+# launch of any not-yet-loaded kernel after residency blocks forever (the
+# driver needs a device-wide sync that a resident persistent kernel never
+# allows) — that was the post-prefill sampling hang. EAGER closes the whole
+# class: warmup coverage no longer has to be perfect. EngineCore subprocesses
+# inherit the variable.
+os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
+
 MODEL = None  # no default: pass --model /path/to/Qwen3.6-27B
 
 

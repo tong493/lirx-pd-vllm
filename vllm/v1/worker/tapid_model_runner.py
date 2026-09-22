@@ -346,8 +346,18 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             staged = hidden.to("cpu", dtype=torch.float32)
             dev = staged.to(self.device, dtype=self.model_config.dtype)
             text_norm(dev)
+        # Greedy sampling: the engine's sampler warmup uses temperature=0.9,
+        # which marks the batch all_random and skips greedy_sample entirely —
+        # so torch.argmax stays lazily unloaded until the first temperature=0
+        # request lands on it post-arm, blocking on the resident kernel.
+        vocab_size = self.model_config.get_vocab_size()
+        dummy_logits = torch.zeros(
+            (2, vocab_size), dtype=torch.float32, device=self.device
+        )
+        torch.argmax(dummy_logits, dim=-1)
         logger.info(
-            "TAPID: preloaded embed/stage/norm kernels for %d token counts",
+            "TAPID: preloaded embed/stage/norm kernels for %d token counts "
+            "and the greedy argmax kernel",
             len(counts),
         )
 
