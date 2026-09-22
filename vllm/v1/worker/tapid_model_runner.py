@@ -443,6 +443,18 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
         )
         self._stop_probe_thread()
+        # TEMP-DIAG(TAPID): the real request froze in the lm_head GEMM with
+        # the resident kernel up; the identical call ran fine pre-arm. Repro
+        # in isolation right after arming — if this drains, the freeze is
+        # step-context-dependent, not GEMM-vs-residency per se.
+        dummy_rows = torch.zeros(
+            (1, self._tapid_hidden_size),
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
+        self.model.compute_logits(dummy_rows)
+        torch.cuda.current_stream().synchronize()
+        logger.info("TAPID-DIAG: post-arm GEMM probe drained")
         self.tapid_armed = True
         logger.info(
             "TAPID armed: persistent prefill program resident (%.1fs)",
