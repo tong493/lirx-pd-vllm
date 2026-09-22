@@ -628,6 +628,15 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 self._tapid_steps, rows, request_id, door_seconds,
                 rows / door_seconds if door_seconds > 0 else 0,
             )
+        # Diagnostic for the post-prefill sampling hang: a stream-scoped drain
+        # proves whether everything enqueued on the main stream up to here
+        # actually executed. Stream syncs are legal post-arm (the patched
+        # torch.cuda.synchronize makes engine-level syncs stream-scoped too);
+        # a device-wide sync is the thing that must never happen.
+        torch.cuda.current_stream().synchronize()
+        logger.info(
+            "TAPID: main stream drained after prefill #%d", self._tapid_steps
+        )
         return normed
 
     def _tapid_text_model(self) -> Any:

@@ -1,15 +1,15 @@
-"""Plain-vLLM prefill baseline (no TAPID): FP32 weights, TF32 disabled.
+"""Plain-vLLM prefill baseline (no TAPID): bf16 weights, TF32 disabled.
 
 The comparison point for the TAPID door (run_tapid_vllm.py). TF32 is killed
-process-wide via NVIDIA_TF32_OVERRIDE=0 (inherited by every TP worker), so
-FP32 matmuls run at true FP32 on the A100 — no tensor-core TF32 shortcut.
-The parent-side torch.backends toggles are belt and suspenders; the env var
-is what actually reaches the EngineCore subprocesses.
+process-wide via NVIDIA_TF32_OVERRIDE=0 (inherited by every TP worker), and
+the parent-side torch.backends toggles are belt and suspenders. The dtype is
+bfloat16 — matching the TAPID door's weight config; float32 is refused
+because the model's GDN layers reject it
+(ChunkGatedDeltaRuleFunction does not support float32).
 
-Memory math: 27B at FP32 is ~108 GiB of weights — does NOT fit a single
-80 GB A100. Default --tp 2 puts ~54 GiB of weights on each of two cards,
-leaving ~20 GiB for activations/KV. The TAPID door runs on one card, so
-compare per-request latency with that asymmetry in mind.
+Memory math: 27B at bf16 is ~54 GiB of weights, which fits a single
+80 GB A100 with room for activations/KV — default --tp 1 keeps the baseline
+on the same one-card footprint as the TAPID door.
 
 wall= includes a few ms of engine scheduling/sample overhead on top of the
 prefill itself; the TAPID door= number is the submit->fetch time only.
@@ -37,12 +37,25 @@ def main() -> int:
     )
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=1)
-    parser.add_argument("--tp", type=int, default=2,
-                        help="27B at FP32 is ~108 GiB of weights: 54 GiB per "
-                        "rank at TP=2 fits an 80 GB A100 with ~20 GiB left "
-                        "for activations/KV. TP=1 cannot fit at all.")
+    parser.add_argument("--tp", type=int, default=1,
+                        help="bf16 27B (~54 GiB) fits one 80 GB card; keep "
+                        "the baseline on the TAPID door's one-card footprint.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--dtype", default="bfloat16",
+                        help="bfloat16 (default) matches the TAPID door's "
+                        "weight dtype. float32 is refused: the model's GDN "
+                        "layers reject it "
+                        "('ChunkGatedDeltaRuleFunction does not support "
+                        "float32'). TF32 stays disabled either way, so "
+                        "bfloat16 matmuls run at true bf16 on the A100.")
     args = parser.parse_args()
+
+    if args.dtype == "float32":
+        parser.error(
+            "--dtype float32 is not supported: the GDN layers "
+            "(ChunkGatedDeltaRuleFunction) reject FP32. Use bfloat16 — that "
+            "is also what the TAPID door runs."
+        )
 
     import torch
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -53,7 +66,7 @@ def main() -> int:
 
     llm = LLM(
         model=args.model,
-        dtype="float32",
+        dtype=args.dtype,
         tensor_parallel_size=args.tp,
         enforce_eager=True,
         max_model_len=args.max_model_len,
