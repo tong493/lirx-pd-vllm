@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 # Eagerly load every CUDA module at context creation, before the TAPID
 # persistent kernel goes resident. Under the default LAZY loading, the first
@@ -62,6 +63,20 @@ def main() -> int:
                         "check (0.99 was rejected at 78.32/79.25 GiB free).")
     parser.add_argument("--no-tapid", action="store_true",
                         help="Run the plain vLLM model (baseline).")
+    parser.add_argument(
+        "--bench-tokens",
+        default="",
+        help="Comma list of exact prompt token counts (e.g. 4,64,1024). "
+        "Runs --bench-reps serial prefills per length from synthetic token "
+        "ids, all in ONE process (TAPID arms once; set TAPID_SKIP_LM_HEAD=1 "
+        "so the engine survives past the first prefill). Overrides --prompt.",
+    )
+    parser.add_argument(
+        "--bench-reps",
+        type=int,
+        default=3,
+        help="Serial repetitions per --bench-tokens length (default 3).",
+    )
     parser.add_argument(
         "--verify", action="store_true",
         help="Ignored: the single-weight-copy design leaves no vLLM decoder "
@@ -146,6 +161,29 @@ def main() -> int:
         limit_mm_per_prompt={"image": 0, "video": 0},
         additional_config=additional_config,
     )
+    if args.bench_tokens:
+        try:
+            from vllm.inputs import TokensPrompt
+        except ImportError:
+            from vllm import TokensPrompt
+        sampling = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+        for raw in args.bench_tokens.split(","):
+            n = int(raw.strip())
+            prompts = [
+                TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
+                for _ in range(args.bench_reps)
+            ]
+            t0 = time.perf_counter()
+            llm.generate(prompts, sampling)
+            wall = time.perf_counter() - t0
+            total = args.bench_reps * n
+            print(
+                f"BENCH length={n} reps={args.bench_reps} "
+                f"wall={wall:.3f}s ({total / wall:.0f} tok/s incl. overhead); "
+                f"per-prefill door= lines above"
+            )
+        return 0
+
     out = llm.generate(
         args.prompt or ["The capital of France is"],
         SamplingParams(temperature=0.0, max_tokens=args.max_tokens),

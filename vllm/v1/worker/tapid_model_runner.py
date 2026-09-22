@@ -22,6 +22,7 @@ in the TAPID repo's model assembly package; nothing here knows the model.
 
 import gc
 import importlib
+import os
 import time
 from typing import Any
 
@@ -49,7 +50,7 @@ _TAPID_FETCH_TIMEOUT_MS = 600_000
 
 # Pre-arm the fetch can block far longer than a decode step ever would; a
 # hung prefill surfaces as this timeout, not as a silent wedge.
-_TAPID_PREFILL_LOG_EVERY = 8
+_TAPID_PREFILL_LOG_EVERY = 1
 
 
 def validate_tapid_config(runner: Any) -> None:
@@ -430,9 +431,36 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
         )
         self.tapid_armed = True
+        if os.environ.get("TAPID_SKIP_LM_HEAD") == "1":
+            self._install_fake_logits()
         logger.info(
             "TAPID armed: persistent prefill program resident (%.1fs)",
             time.monotonic() - started,
+        )
+
+    def _install_fake_logits(self) -> None:
+        """BENCH ONLY: replace the lm_head GEMM with a zeros tensor.
+
+        The post-arm lm_head GEMM is the one op that never executes under the
+        resident persistent kernel (the unsolved sampling freeze). For prefill
+        timing the logit values are irrelevant: with --max-tokens 1 the
+        request finishes after one fabricated token. The rest of the sampler
+        and the engine's output machinery run unmodified.
+        """
+        vocab = self.model_config.get_vocab_size()
+
+        def zeros_logits(hidden_states: torch.Tensor, *_args: Any,
+                         **_kwargs: Any) -> torch.Tensor:
+            return torch.zeros(
+                (hidden_states.shape[0], vocab),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+
+        self.model.compute_logits = zeros_logits
+        logger.warning(
+            "TAPID bench: lm_head GEMM bypassed (TAPID_SKIP_LM_HEAD=1); "
+            "sampled tokens are meaningless, prefill door= timings stay valid"
         )
 
     # ---- forwards ----------------------------------------------------------
