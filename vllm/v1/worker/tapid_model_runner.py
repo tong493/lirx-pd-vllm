@@ -125,6 +125,40 @@ def _restore_device_sync() -> None:
             module.synchronize = original
 
 
+def _install_spin_wait_output_event() -> None:
+    """Swap AsyncOutput's blocking copy event for a spin-wait one.
+
+    The engine waits on ``torch.cuda.Event(blocking=True)`` (the
+    cudaEventBlockingSync flavor: the host thread sleeps on a driver
+    interrupt) for the async D2H output copy. py-spy has pinned the sampling
+    hang to exactly that wait. Diagnostic and candidate fix in one: a
+    spin-wait event polls the GPU-side completion instead. If the hang
+    disappears, the blocking wait never waking under the resident persistent
+    kernel was the problem; if it survives, the copy itself never executes
+    and the next probe has to chase the copy stream.
+    """
+    import vllm.v1.worker.gpu.async_utils as async_utils_mod
+
+    original_init = async_utils_mod.AsyncOutput.__init__
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_event = torch.cuda.Event
+
+        class _SpinEvent(original_event):  # type: ignore[name-defined]
+            def __init__(self, *event_args: Any, **event_kwargs: Any) -> None:
+                event_kwargs.pop("blocking", None)
+                super().__init__(*event_args, **event_kwargs)
+
+        torch.cuda.Event = _SpinEvent
+        try:
+            original_init(self, *args, **kwargs)
+        finally:
+            torch.cuda.Event = original_event
+
+    async_utils_mod.AsyncOutput.__init__ = patched_init  # type: ignore[assignment]
+    logger.info("TAPID: AsyncOutput copy event swapped to spin-wait")
+
+
 def _import_tapid_modules() -> tuple[Any, Any]:
     try:
         door = importlib.import_module(_TAPID_DOOR_MODULE)
@@ -373,6 +407,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         if self.tapid_session is None:
             return
         _install_stream_only_sync(self.device)
+        _install_spin_wait_output_event()
         started = time.monotonic()
         self.tapid_session.launch()
         # Same settle window the bench runner uses: the resident CTAs come up
@@ -642,6 +677,22 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     def _tapid_text_model(self) -> Any:
         candidate = getattr(self.model, "language_model", None) or self.model
         return getattr(candidate, "model", None) or candidate
+
+    def sample_tokens(self, grammar_output: Any = None) -> Any:
+        """Diagnostic wrapper: prove the sampler-era kernels executed.
+
+        The post-prefill hang sits in the engine's wait for the async output
+        copy, one step AFTER this method returns. A stream-scoped drain here
+        splits the space: if this log prints, everything enqueued on the main
+        stream through the sampler actually ran on the device and the freeze
+        is in the copy/event machinery; if not, a sampler-era kernel is the
+        one that never executes.
+        """
+        output = super().sample_tokens(grammar_output)
+        if self.tapid_armed:
+            torch.cuda.current_stream().synchronize()
+            logger.info("TAPID: post-sample main stream drained")
+        return output
 
     # ---- shutdown ----------------------------------------------------------
 
