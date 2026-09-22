@@ -461,39 +461,71 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             time.monotonic() - started,
         )
 
-    def _log_gpu_probe(self) -> None:
-        """Log device utilization/memory from outside the process.
+    def _gpu_state_lines(self) -> list[str]:
+        """Whole-machine GPU table + compute-app list, joined by GPU UUID.
 
-        ~100% util means the persistent kernel went resident and is spinning;
-        0% means the launch never took. Reads via nvidia-smi so no CUDA call
-        of our own can perturb the state being observed.
+        A single ``nvidia-smi -i <index>`` is ambiguous under
+        CUDA_VISIBLE_DEVICES (torch's device 0 is whichever physical GPU the
+        env picked), so log every card and the process list instead: the UUID
+        column ties the process table to the util table, and the PID column
+        finds our own footprint.
         """
-        try:
-            import subprocess
+        import os
+        import subprocess
 
+        def _smi(query_args: list[str]) -> str:
             probe = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=utilization.gpu,memory.used,memory.total",
-                    "--format=csv,noheader",
-                    "-i", str(self.device.index or 0),
-                ],
+                ["nvidia-smi", *query_args, "--format=csv,noheader"],
                 capture_output=True,
                 text=True,
                 timeout=10,
             )
-            logger.info(
-                "TAPID: post-launch GPU probe (util, mem used/total): %s",
-                probe.stdout.strip() or probe.stderr.strip(),
-            )
+            return probe.stdout.strip() or probe.stderr.strip()
+
+        try:
+            lines = [
+                f"TAPID: pid={os.getpid()} CUDA_VISIBLE_DEVICES="
+                f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+                "TAPID: per-GPU (index, uuid, util, mem used/total):",
+                *[
+                    "  " + line
+                    for line in _smi(
+                        [
+                            "--query-gpu=index,gpu_uuid,utilization.gpu,"
+                            "memory.used,memory.total"
+                        ]
+                    ).splitlines()
+                ],
+                "TAPID: compute apps (uuid, pid, mem):",
+                *[
+                    "  " + line
+                    for line in _smi(
+                        ["--query-compute-apps=gpu_uuid,pid,used_memory"]
+                    ).splitlines()
+                ],
+            ]
         except Exception as exc:
-            logger.info("TAPID: GPU probe unavailable: %s", exc)
+            lines = [f"TAPID: GPU probe unavailable: {exc}"]
+        return lines
+
+    def _log_gpu_probe(self) -> None:
+        """Log device state from outside the process.
+
+        ~100% util on OUR gpu means the persistent kernel went resident and
+        is spinning; 0% means the launch never took. Reads via nvidia-smi so
+        no CUDA call of our own can perturb the state being observed.
+        """
+        for line in self._gpu_state_lines():
+            logger.info("%s", line)
 
     def _start_probe_thread(self) -> None:
-        """Sample GPU util every 20s while set_program is blocking.
+        """Sample the whole-machine GPU state every 20s while set_program
+        blocks.
 
         If the device-ack hang is the kernel spinning without consuming the
-        host command, the samples say ~100%; if the launch never took, 0%.
+        host command, our GPU's samples say ~100%; if the launch never took,
+        0%. The whole table (not a single card) because the process-to-GPU
+        mapping under CUDA_VISIBLE_DEVICES is easy to get wrong.
         """
         import threading
 
@@ -501,26 +533,8 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
 
         def _sample() -> None:
             while not stop.wait(20):
-                try:
-                    import subprocess
-
-                    probe = subprocess.run(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=utilization.gpu",
-                            "--format=csv,noheader",
-                            "-i", str(self.device.index or 0),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    logger.info(
-                        "TAPID: set_program pending, GPU util: %s",
-                        probe.stdout.strip(),
-                    )
-                except Exception:
-                    pass
+                for line in self._gpu_state_lines():
+                    logger.info("TAPID: set_program pending | %s", line)
 
         self._probe_stop = stop
         threading.Thread(target=_sample, daemon=True).start()
