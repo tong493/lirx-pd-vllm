@@ -393,9 +393,21 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             (2, vocab_size), dtype=torch.float32, device=self.device
         )
         torch.argmax(dummy_logits, dim=-1)
+        # The logits GEMM: cuBLAS picks a different kernel per (M, N, K) and
+        # loads that kernel's module inside the library, which
+        # CUDA_MODULE_LOADING=EAGER does not cover. The real request samples
+        # M=1 rows (one per request); sweep a few M values so no post-arm
+        # launch lands on a lazily-loaded cuBLAS kernel.
+        hidden = self._tapid_hidden_size
+        for rows in (1, 2, 4, 8):
+            dummy_hidden = torch.zeros(
+                (rows, hidden), dtype=self.model_config.dtype, device=self.device
+            )
+            self.model.compute_logits(dummy_hidden)
+            torch.cuda.synchronize()
         logger.info(
-            "TAPID: preloaded embed/stage/norm kernels for %d token counts "
-            "and the greedy argmax kernel",
+            "TAPID: preloaded embed/stage/norm kernels for %d token counts, "
+            "the greedy argmax kernel, and the logits GEMM for M in (1, 2, 4, 8)",
             len(counts),
         )
 

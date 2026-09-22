@@ -1318,6 +1318,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        # TEMP-DIAG(TAPID): log the sampled row count — warmup vs real M is
+        # the cuBLAS-kernel-selection delta under investigation.
+        logger.info(
+            "TAPID-DIAG: sampling rows=%d (hidden rows=%d)",
+            sample_hidden_states.shape[0],
+            hidden_states.shape[0],
+        )
         logits = self.model.compute_logits(sample_hidden_states)
         # TEMP-DIAG(TAPID): bisect the post-prefill sampling freeze.
         torch.cuda.current_stream().synchronize()
