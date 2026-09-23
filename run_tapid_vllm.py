@@ -21,6 +21,21 @@ import time
 # class: warmup coverage no longer has to be perfect. EngineCore subprocesses
 # inherit the variable.
 os.environ.setdefault("CUDA_MODULE_LOADING", "EAGER")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
+
+# run_e2e.sh puts the TAPID door and the model adapter on PYTHONPATH and
+# points TAPID_PY_LIB at the checkout build. A hand-invoked `python` skips
+# that, so redo it here from $TAPID_REPO — and fail loudly when it is unset
+# instead of dying in a bare ImportError deep inside engine init.
+_TAPID_REPO = os.environ.get("TAPID_REPO", "")
+if _TAPID_REPO:
+    _vllm_repo = os.path.dirname(os.path.abspath(__file__))
+    for _p in (_vllm_repo, _TAPID_REPO, os.path.join(_TAPID_REPO, "python")):
+        if os.path.isdir(_p) and _p not in sys.path:
+            sys.path.insert(0, _p)
+    os.environ.setdefault(
+        "TAPID_PY_LIB", os.path.join(_TAPID_REPO, "build", "libtapid_py.so")
+    )
 
 MODEL = None  # no default: pass --model /path/to/Qwen3.6-27B
 
@@ -105,6 +120,14 @@ def main() -> int:
         help="Ignored: TAPID writes no vLLM KV/GDN state in the prefill door.",
     )
     args = parser.parse_args()
+
+    if not args.no_tapid and not _TAPID_REPO:
+        parser.error(
+            "TAPID_REPO is unset, so the TAPID door cannot be imported. "
+            "export TAPID_REPO=/path/to/gpu_daemon (or launch through "
+            "run_e2e.sh, which sets it up); use --no-tapid for the plain "
+            "vLLM baseline."
+        )
 
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = args.max_model_len
