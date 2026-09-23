@@ -1,8 +1,9 @@
-"""Plain-vLLM prefill baseline (no TAPID): bf16 weights, TF32 disabled.
+"""Plain-vLLM prefill baseline (no TAPID): bf16 weights.
 
-The comparison point for the TAPID door (run_tapid_vllm.py). TF32 is killed
-process-wide via NVIDIA_TF32_OVERRIDE=0 (inherited by every TP worker), and
-the parent-side torch.backends toggles are belt and suspenders. The dtype is
+The comparison point for the TAPID door (run_tapid_vllm.py). NVIDIA_TF32_OVERRIDE=0
+and the torch.backends toggles are inert for a bf16 run — TF32 only ever
+applies to fp32 matmuls, and a bf16 model has essentially none — kept as
+harmless insurance from the abandoned FP32 plan. The dtype is
 bfloat16 — matching the TAPID door's weight config; float32 is refused
 because the model's GDN layers reject it
 (ChunkGatedDeltaRuleFunction does not support float32).
@@ -37,6 +38,18 @@ def main() -> int:
     )
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--bench-tokens",
+        default=None,
+        help="Comma-separated exact token lengths (e.g. 4,64,1024). Each "
+        "length is timed --bench-reps times as a single-request generate "
+        "with a TokensPrompt of that exact length and the same filler ids "
+        "run_tapid_vllm.py uses, so the two benches see identical inputs.",
+    )
+    parser.add_argument(
+        "--bench-reps", type=int, default=3,
+        help="Repetitions per length in --bench-tokens mode.",
+    )
     parser.add_argument("--tp", type=int, default=1,
                         help="bf16 27B (~54 GiB) fits one 80 GB card; keep "
                         "the baseline on the TAPID door's one-card footprint.")
@@ -46,8 +59,7 @@ def main() -> int:
                         "weight dtype. float32 is refused: the model's GDN "
                         "layers reject it "
                         "('ChunkGatedDeltaRuleFunction does not support "
-                        "float32'). TF32 stays disabled either way, so "
-                        "bfloat16 matmuls run at true bf16 on the A100.")
+                        "float32').")
     args = parser.parse_args()
 
     if args.dtype == "float32":
@@ -78,6 +90,28 @@ def main() -> int:
         enable_prefix_caching=False,
         limit_mm_per_prompt={"image": 0, "video": 0},
     )
+
+    if args.bench_tokens:
+        try:
+            from vllm.inputs import TokensPrompt
+        except ImportError:
+            from vllm import TokensPrompt
+        sampling = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+        # Same filler ids and timing shape as run_tapid_vllm.py's serial
+        # bench: one exact-length TokensPrompt per generate call, so the two
+        # measurements differ only in the engine behind the door.
+        for raw in args.bench_tokens.split(","):
+            n = int(raw.strip())
+            for rep in range(args.bench_reps):
+                prompt = TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
+                t0 = time.perf_counter()
+                llm.generate([prompt], sampling)
+                wall = time.perf_counter() - t0
+                print(
+                    f"BASELINE bench length={n} rep={rep}: wall={wall:.3f}s "
+                    f"({n / wall:.0f} tok/s incl. overhead)"
+                )
+        return 0
 
     prompts = args.prompt or ["The capital of France is"]
     for prompt in prompts:
