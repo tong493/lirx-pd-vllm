@@ -664,7 +664,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         )
 
         fetch_started = time.monotonic()
-        parts: list[torch.Tensor] = []
+        flats: list[np.ndarray] = []
         arrivals: list[float] = []
         fetch_deadline = fetch_started + _TAPID_FETCH_TIMEOUT_MS / 1000.0
         for (start, end), request_id in zip(bounds, request_ids):
@@ -703,16 +703,21 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                     f"{request_id:#x}, expected {n_rows}x"
                     f"{self._tapid_hidden_size}"
                 )
-            # Writable numpy view over the fetch buffer -> device BF16. Every
-            # module here was loaded by _warm_tapid_kernels; from_numpy and
-            # the copies themselves launch no lazily-loaded kernels.
-            parts.append(
-                torch.from_numpy(
-                    np.asarray(out_flat).reshape(out_rows, out_cols)
-                ).to(self.device, dtype=self.model_config.dtype)
-            )
+            # Keep the result on HOST (writable numpy view over the fetch
+            # buffer, freshly allocated per call): the multi-request path
+            # must reuse the serial path's exact post-door stream recipe.
+            # py-spy pinned the parallel-round wedge to the drain sync below,
+            # and the only ops there serial never exercised post-arm were
+            # torch.cat and the back-to-back per-request H2D copies — so
+            # neither runs anymore: concat on host, ONE copy, ONE norm.
+            flats.append(np.asarray(out_flat).reshape(out_rows, out_cols))
         door_seconds = time.monotonic() - door_started
-        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        host = flats[0] if len(flats) == 1 else np.concatenate(flats, axis=0)
+        out = torch.from_numpy(host).to(
+            self.device, dtype=self.model_config.dtype
+        )
+        torch.cuda.current_stream().synchronize()
+        logger.info("TAPID: post-door H2D drained (rows=%d)", out.shape[0])
         normed = self._tapid_text_model().norm(out)
         if isinstance(normed, tuple):
             normed = normed[0]
