@@ -52,10 +52,10 @@ _TAPID_FETCH_TIMEOUT_MS = 600_000
 # hung prefill surfaces as this timeout, not as a silent wedge.
 _TAPID_PREFILL_LOG_EVERY = 1
 # Merged fresh prefills per step: vLLM's continuous batching admits several
-# requests at once and the door submits their rows as one TAPID batch. The
-# per-request computed==0 check below is what actually guards the door; this
-# only bounds the batch width (rows are capped separately by
-# MAX_PREFILL_TOKENS).
+# requests at once; the door submits each request as its own TAPID batch
+# (own input buffer / terminal slot). The per-request computed==0 and row
+# checks in _prefill_batch are what actually guard the door; this only
+# bounds how wide one step's fan-out may be.
 _TAPID_MAX_REQS_PER_STEP = 8
 
 
@@ -82,13 +82,11 @@ def validate_tapid_config(runner: Any) -> None:
         raise ValueError("TAPID P0/P1 does not support quantization")
 
     adapter = runner.tapid_adapter
-    max_batched = int(runner.scheduler_config.max_num_batched_tokens)
-    if max_batched > adapter.MAX_PREFILL_TOKENS:
-        raise ValueError(
-            "TAPID prefill takes the whole prompt in one step; "
-            f"max_num_batched_tokens={max_batched} exceeds the kernel's row "
-            f"buffer of {adapter.MAX_PREFILL_TOKENS}"
-        )
+    # The door splits a step per request — each request becomes its own TAPID
+    # batch bounded by MAX_PREFILL_TOKENS (checked per request in
+    # _prefill_batch) — so the STEP budget may exceed the row buffer: 4x1024
+    # needs max_num_batched_tokens=4096. The invariant that stays is
+    # per-sequence: one prompt must prefill in one step, unchunked.
     if runner.model_config.max_model_len > adapter.MAX_PREFILL_TOKENS:
         raise ValueError(
             f"max_model_len={runner.model_config.max_model_len} cannot be "
