@@ -83,15 +83,18 @@ def validate_tapid_config(runner: Any) -> None:
 
     adapter = runner.tapid_adapter
     # The door splits a step per request — each request becomes its own TAPID
-    # batch bounded by MAX_PREFILL_TOKENS (checked per request in
-    # _prefill_batch) — so the STEP budget may exceed the row buffer: 4x1024
-    # needs max_num_batched_tokens=4096. The invariant that stays is
-    # per-sequence: one prompt must prefill in one step, unchunked.
-    if runner.model_config.max_model_len > adapter.MAX_PREFILL_TOKENS:
+    # batch, checked against MAX_PREFILL_TOKENS at runtime — so the step
+    # budget and max_model_len may both exceed the row buffer (4x1024 needs
+    # 4096). What must hold statically: the budget admits a whole sequence,
+    # else vLLM chunk-prefills, which the door refuses.
+    max_batched = int(runner.scheduler_config.max_num_batched_tokens)
+    if runner.model_config.max_model_len > max_batched:
         raise ValueError(
-            f"max_model_len={runner.model_config.max_model_len} cannot be "
-            f"prefilled in one step (kernel row buffer is "
-            f"{adapter.MAX_PREFILL_TOKENS}); lower max_model_len"
+            f"max_num_batched_tokens={max_batched} < max_model_len="
+            f"{runner.model_config.max_model_len} would chunk prefill, which "
+            "TAPID refuses. Raise --max-num-batched-tokens (it may exceed "
+            "the kernel's 2560-row buffer: each request is submitted as its "
+            "own TAPID batch, bounded per request at runtime)."
         )
 
 
