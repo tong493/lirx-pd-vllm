@@ -48,6 +48,12 @@ _TAPID_ADAPTER_MODULE = "models.model_assembly.qwen3_6_27b_dense.vllm_adapter"
 _TAPID_BIND_TIMEOUT_MS = 1_800_000
 _TAPID_PROGRAM_TIMEOUT_MS = 600_000
 _TAPID_FETCH_TIMEOUT_MS = 600_000
+# The long fetch timeout used to sit silent for its full duration. Chunk it:
+# every chunk that returns nothing logs a heartbeat naming the request still
+# pending, and the total deadline ends in a device-side scheduling snapshot
+# (tapid_debug_dump, twice — what did not move is the stall) before raising.
+_TAPID_FETCH_CHUNK_MS = 30_000
+_TAPID_DUMP_GAP_S = 5.0
 
 # Pre-arm the fetch can block far longer than a decode step ever would; a
 # hung prefill surfaces as this timeout, not as a silent wedge.
@@ -648,17 +654,48 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 request_id, hidden[start:end], self._tapid_hidden_size
             )
         submit_seconds = time.monotonic() - door_started
+        # Marker between the submit and fetch phases: silence BEFORE this line
+        # means a submit-stage stall (staging D2H / feeder H2D), silence AFTER
+        # means the device never delivered a terminal result.
+        logger.info(
+            "TAPID: submitted reqs=%s rows=%s (submit=%.4fs)",
+            request_ids, [end - start for start, end in bounds],
+            submit_seconds,
+        )
 
         fetch_started = time.monotonic()
         parts: list[torch.Tensor] = []
         arrivals: list[float] = []
+        fetch_deadline = fetch_started + _TAPID_FETCH_TIMEOUT_MS / 1000.0
         for (start, end), request_id in zip(bounds, request_ids):
             n_rows = end - start
-            out_flat, out_rows, out_cols = self.tapid_session.fetch_array(
-                request_id,
-                n_rows * self._tapid_hidden_size,
-                timeout_ms=_TAPID_FETCH_TIMEOUT_MS,
-            )
+            while True:
+                try:
+                    out_flat, out_rows, out_cols = (
+                        self.tapid_session.fetch_array(
+                            request_id,
+                            n_rows * self._tapid_hidden_size,
+                            timeout_ms=_TAPID_FETCH_CHUNK_MS,
+                        )
+                    )
+                    break
+                except self.tapid_door.TapidError as exc:
+                    if "timed out" not in str(exc):
+                        raise
+                    now = time.monotonic()
+                    if now >= fetch_deadline:
+                        logger.error(
+                            "TAPID: request %d (rows=%d) produced no terminal "
+                            "output after %.0fs — dumping device state",
+                            request_id, n_rows, now - fetch_started,
+                        )
+                        self._dump_tapid_stall(f"fetch req={request_id}")
+                        raise
+                    logger.info(
+                        "TAPID: still waiting for request %d (rows=%d, "
+                        "%.0fs elapsed)", request_id, n_rows,
+                        now - fetch_started,
+                    )
             arrivals.append(time.monotonic() - fetch_started)
             if (out_rows, out_cols) != (n_rows, self._tapid_hidden_size):
                 raise RuntimeError(
@@ -700,6 +737,25 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             "TAPID: main stream drained after prefill #%d", self._tapid_steps
         )
         return normed
+
+    def _dump_tapid_stall(self, where: str) -> None:
+        """Device-side hang snapshot, twice: what did not move is the stall.
+
+        tapid_debug_dump prints the live scheduler state (issuer status,
+        scoreboards, work-pool budget) from inside the resident kernel's
+        host agent. The dump must never mask the error that triggered it.
+        """
+        dump = getattr(self.tapid_session, "debug_dump", None)
+        if dump is None:
+            return
+        for i in (1, 2):
+            logger.error("TAPID stall snapshot #%d (%s):", i, where)
+            try:
+                dump(0)
+            except Exception as exc:
+                logger.error("TAPID debug_dump failed: %s", exc)
+            if i == 1:
+                time.sleep(_TAPID_DUMP_GAP_S)
 
     def _tapid_text_model(self) -> Any:
         candidate = getattr(self.model, "language_model", None) or self.model
