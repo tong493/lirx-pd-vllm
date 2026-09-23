@@ -75,7 +75,17 @@ def main() -> int:
         "--bench-reps",
         type=int,
         default=3,
-        help="Serial repetitions per --bench-tokens length (default 3).",
+        help="Repetitions per --bench-tokens length (default 3), for both "
+        "the serial and the --bench-parallel rounds.",
+    )
+    parser.add_argument(
+        "--bench-parallel",
+        type=int,
+        default=0,
+        help="Concurrent requests per parallel round (e.g. 4). vLLM merges "
+        "the requests into one prefill step (rows=4xL in the door= line), "
+        "bounded by the 2560-row TAPID buffer: 4x1024 arrives as two "
+        "merged steps of 2048 rows. 0 = serial only.",
     )
     parser.add_argument(
         "--verify", action="store_true",
@@ -96,6 +106,15 @@ def main() -> int:
 
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = args.max_model_len
+    if args.bench_tokens and args.bench_parallel > 0:
+        args.max_num_seqs = max(args.max_num_seqs, args.bench_parallel)
+        if not args.no_tapid:
+            # TAPID's row buffer caps one merged prefill at 2560 rows; a
+            # larger scheduler budget makes the runner raise instead of
+            # splitting the batch.
+            args.max_num_batched_tokens = min(
+                args.max_num_batched_tokens, 2560
+            )
     if args.verify or args.state_audit or args.probe != "full":
         print(
             "NOTE: --verify/--probe/--state-audit are ignored by the "
@@ -169,19 +188,29 @@ def main() -> int:
         sampling = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
         for raw in args.bench_tokens.split(","):
             n = int(raw.strip())
-            prompts = [
-                TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
-                for _ in range(args.bench_reps)
-            ]
-            t0 = time.perf_counter()
-            llm.generate(prompts, sampling)
-            wall = time.perf_counter() - t0
-            total = args.bench_reps * n
-            print(
-                f"BENCH length={n} reps={args.bench_reps} "
-                f"wall={wall:.3f}s ({total / wall:.0f} tok/s incl. overhead); "
-                f"per-prefill door= lines above"
-            )
+            for rep in range(args.bench_reps):
+                prompt = TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
+                t0 = time.perf_counter()
+                llm.generate([prompt], sampling)
+                wall = time.perf_counter() - t0
+                print(
+                    f"BENCH serial  length={n} rep={rep}: wall={wall:.3f}s "
+                    f"({n / wall:.0f} tok/s incl. overhead)"
+                )
+            if args.bench_parallel > 0:
+                prompt = TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
+                prompts = [prompt] * args.bench_parallel
+                for rep in range(args.bench_reps):
+                    t0 = time.perf_counter()
+                    llm.generate(prompts, sampling)
+                    wall = time.perf_counter() - t0
+                    total = args.bench_parallel * n
+                    print(
+                        f"BENCH parallel w={args.bench_parallel} length={n} "
+                        f"rep={rep}: wall={wall:.3f}s "
+                        f"({total / wall:.0f} tok/s incl. overhead); "
+                        f"see door= lines for the merged rows="
+                    )
         return 0
 
     out = llm.generate(

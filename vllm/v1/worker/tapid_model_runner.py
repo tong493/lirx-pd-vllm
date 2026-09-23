@@ -51,6 +51,12 @@ _TAPID_FETCH_TIMEOUT_MS = 600_000
 # Pre-arm the fetch can block far longer than a decode step ever would; a
 # hung prefill surfaces as this timeout, not as a silent wedge.
 _TAPID_PREFILL_LOG_EVERY = 1
+# Merged fresh prefills per step: vLLM's continuous batching admits several
+# requests at once and the door submits their rows as one TAPID batch. The
+# per-request computed==0 check below is what actually guards the door; this
+# only bounds the batch width (rows are capped separately by
+# MAX_PREFILL_TOKENS).
+_TAPID_MAX_REQS_PER_STEP = 8
 
 
 def validate_tapid_config(runner: Any) -> None:
@@ -538,36 +544,38 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
 
         query_start_loc = batch_md.query_start_loc.cpu()
         num_reqs = query_start_loc.numel() - 1
-        if num_reqs != 1:
+        if not 1 <= num_reqs <= _TAPID_MAX_REQS_PER_STEP:
             raise RuntimeError(
-                f"TAPID prefill runs exactly one request per step, got "
-                f"{num_reqs}; run with --max-num-seqs 1 and one request at a "
-                f"time"
+                f"TAPID prefill runs 1..{_TAPID_MAX_REQS_PER_STEP} requests "
+                f"per step, got {num_reqs}"
             )
         rows = int(query_start_loc[-1].item())
-        query_len = int(query_start_loc[1].item()) - int(query_start_loc[0].item())
-        seq_len = int(batch_md.seq_lens[0].item())
-        computed = seq_len - query_len
-        if computed != 0:
-            hint = (
-                "decode step"
-                if query_len == 1
-                else "chunked prefill (run with --max-num-batched-tokens >= "
-                "--max-model-len to prefill in one step)"
+        seq_lens = batch_md.seq_lens.cpu()
+        for i in range(num_reqs):
+            query_len = (
+                int(query_start_loc[i + 1]) - int(query_start_loc[i])
             )
-            raise RuntimeError(
-                f"TAPID prefill cannot continue a sequence ({hint}; "
-                f"{computed} tokens already computed). Decode is out of scope: "
-                f"use --max-tokens 1 to measure prefill only."
-            )
-        return rows, batch_md
+            computed = int(seq_lens[i]) - query_len
+            if computed != 0:
+                hint = (
+                    "decode step"
+                    if query_len == 1
+                    else "chunked prefill (run with --max-num-batched-tokens >= "
+                    "--max-model-len to prefill in one step)"
+                )
+                raise RuntimeError(
+                    f"TAPID prefill cannot continue a sequence (request {i}: "
+                    f"{hint}; {computed} tokens already computed). Decode is "
+                    f"out of scope: use --max-tokens 1 to measure prefill only."
+                )
+        return rows, num_reqs, batch_md
 
     def _tapid_prefill_forward(
         self,
         input_ids: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
     ) -> Any:
-        rows, _batch_md = self._prefill_batch()
+        rows, num_reqs, _batch_md = self._prefill_batch()
         if rows <= 0 or rows > self.tapid_adapter.MAX_PREFILL_TOKENS:
             raise RuntimeError(
                 f"TAPID prefill row count {rows} outside (0, "
@@ -618,9 +626,9 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self._tapid_steps += 1
         if self._tapid_steps % _TAPID_PREFILL_LOG_EVERY == 1:
             logger.info(
-                "TAPID prefill #%d: rows=%d request_id=%#x door=%.4fs "
-                "(%.0f tok/s)",
-                self._tapid_steps, rows, request_id, door_seconds,
+                "TAPID prefill #%d: rows=%d reqs=%d request_id=%#x "
+                "door=%.4fs (%.0f tok/s)",
+                self._tapid_steps, rows, num_reqs, request_id, door_seconds,
                 rows / door_seconds if door_seconds > 0 else 0,
             )
         # Diagnostic for the post-prefill sampling hang: a stream-scoped drain
