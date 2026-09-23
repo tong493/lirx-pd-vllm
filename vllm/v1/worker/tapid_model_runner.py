@@ -35,6 +35,7 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -448,11 +449,8 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     def _install_fake_logits(self) -> None:
         """BENCH ONLY: replace the lm_head GEMM with a zeros tensor.
 
-        The post-arm lm_head GEMM is the one op that never executes under the
-        resident persistent kernel (the unsolved sampling freeze). For prefill
-        timing the logit values are irrelevant: with --max-tokens 1 the
-        request finishes after one fabricated token. The rest of the sampler
-        and the engine's output machinery run unmodified.
+        Kept for non-bench sampling paths; the bench path below skips the
+        sampler entirely.
         """
         vocab = self.model_config.get_vocab_size()
 
@@ -469,6 +467,43 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             "TAPID bench: lm_head GEMM bypassed (TAPID_SKIP_LM_HEAD=1); "
             "sampled tokens are meaningless, prefill door= timings stay valid"
         )
+
+    def _bench_sampling_skipped(self) -> bool:
+        return (
+            self.tapid_armed
+            and os.environ.get("TAPID_SKIP_LM_HEAD") == "1"
+        )
+
+    def sample_tokens(self, grammar_output: Any = None) -> Any:
+        """BENCH ONLY: drop everything after the term-out door.
+
+        The post-prefill machinery is exactly what never runs under the
+        resident persistent kernel: the sampler's kernels, the AsyncOutput
+        D2H copy (a second stream + event wait -- where the very first
+        py-spy pinned this hang), and the triton postprocess kernels. In
+        bench mode none of it is needed: fabricate the finished
+        ModelRunnerOutput host-side (token id 0 per request; --max-tokens 1
+        finishes each request immediately) so the scheduler can line up the
+        next prefill while the persistent kernel stays resident.
+        """
+        if not self._bench_sampling_skipped():
+            return super().sample_tokens(grammar_output)
+        state = self.execute_model_state
+        self.execute_model_state = None
+        input_batch = state.input_batch
+        req_ids = list(input_batch.req_ids)
+        output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={
+                req_id: i for i, req_id in enumerate(req_ids)
+            },
+            sampled_token_ids=[[0] for _ in req_ids],
+            prompt_logprobs_dict={},
+        )
+        output.kv_connector_output = self.kv_connector.post_forward(
+            state.finished_req_ids
+        )
+        return output
 
     # ---- forwards ----------------------------------------------------------
     def _model_forward(
