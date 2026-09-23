@@ -551,15 +551,16 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             )
         rows = int(query_start_loc[-1].item())
         seq_lens = batch_md.seq_lens.cpu()
+        max_rows = self.tapid_adapter.MAX_PREFILL_TOKENS
+        bounds = []
         for i in range(num_reqs):
-            query_len = (
-                int(query_start_loc[i + 1]) - int(query_start_loc[i])
-            )
-            computed = int(seq_lens[i]) - query_len
+            start = int(query_start_loc[i])
+            end = int(query_start_loc[i + 1])
+            computed = int(seq_lens[i]) - (end - start)
             if computed != 0:
                 hint = (
                     "decode step"
-                    if query_len == 1
+                    if end - start == 1
                     else "chunked prefill (run with --max-num-batched-tokens >= "
                     "--max-model-len to prefill in one step)"
                 )
@@ -568,19 +569,20 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                     f"{hint}; {computed} tokens already computed). Decode is "
                     f"out of scope: use --max-tokens 1 to measure prefill only."
                 )
-        return rows, num_reqs, batch_md
+            if not 0 < end - start <= max_rows:
+                raise RuntimeError(
+                    f"TAPID prefill request {i} row count {end - start} "
+                    f"outside (0, {max_rows}]"
+                )
+            bounds.append((start, end))
+        return rows, num_reqs, bounds
 
     def _tapid_prefill_forward(
         self,
         input_ids: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
     ) -> Any:
-        rows, num_reqs, _batch_md = self._prefill_batch()
-        if rows <= 0 or rows > self.tapid_adapter.MAX_PREFILL_TOKENS:
-            raise RuntimeError(
-                f"TAPID prefill row count {rows} outside (0, "
-                f"{self.tapid_adapter.MAX_PREFILL_TOKENS}]"
-            )
+        rows, num_reqs, bounds = self._prefill_batch()
         if inputs_embeds is not None:
             hidden = inputs_embeds
         elif input_ids is not None:
@@ -595,40 +597,61 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 f"rows of width {self._tapid_hidden_size}"
             )
 
-        request_id = self._tapid_next_request
-        self._tapid_next_request += 1
+        # One TAPID batch per request: each request lands in its own input
+        # buffer / terminal slot (the request_id selects the pool entry), so
+        # concurrent requests' pipelines overlap inside the kernel. Every
+        # submit is queued before any fetch waits — tapid_submit_v2 only
+        # enqueues; the wait happens in fetch.
         door_started = time.monotonic()
-        self.tapid_session.submit_hidden(
-            request_id, hidden[:rows], self._tapid_hidden_size
-        )
-        out_flat, out_rows, out_cols = self.tapid_session.fetch_array(
-            request_id,
-            rows * self._tapid_hidden_size,
-            timeout_ms=_TAPID_FETCH_TIMEOUT_MS,
-        )
-        door_seconds = time.monotonic() - door_started
-        if (out_rows, out_cols) != (rows, self._tapid_hidden_size):
-            raise RuntimeError(
-                f"TAPID returned {out_rows}x{out_cols}, expected "
-                f"{rows}x{self._tapid_hidden_size}"
+        request_ids: list[int] = []
+        for start, end in bounds:
+            request_id = self._tapid_next_request
+            self._tapid_next_request += 1
+            request_ids.append(request_id)
+            self.tapid_session.submit_hidden(
+                request_id, hidden[start:end], self._tapid_hidden_size
             )
+        submit_seconds = time.monotonic() - door_started
 
-        # Writable numpy view over the fetch buffer -> device BF16 -> final
-        # norm. Every module here was loaded by _warm_tapid_kernels; from_numpy
-        # and the copies themselves launch no lazily-loaded kernels.
-        out = torch.from_numpy(
-            np.asarray(out_flat).reshape(out_rows, out_cols)
-        ).to(self.device, dtype=self.model_config.dtype)
+        fetch_started = time.monotonic()
+        parts: list[torch.Tensor] = []
+        arrivals: list[float] = []
+        for (start, end), request_id in zip(bounds, request_ids):
+            n_rows = end - start
+            out_flat, out_rows, out_cols = self.tapid_session.fetch_array(
+                request_id,
+                n_rows * self._tapid_hidden_size,
+                timeout_ms=_TAPID_FETCH_TIMEOUT_MS,
+            )
+            arrivals.append(time.monotonic() - fetch_started)
+            if (out_rows, out_cols) != (n_rows, self._tapid_hidden_size):
+                raise RuntimeError(
+                    f"TAPID returned {out_rows}x{out_cols} for request "
+                    f"{request_id:#x}, expected {n_rows}x"
+                    f"{self._tapid_hidden_size}"
+                )
+            # Writable numpy view over the fetch buffer -> device BF16. Every
+            # module here was loaded by _warm_tapid_kernels; from_numpy and
+            # the copies themselves launch no lazily-loaded kernels.
+            parts.append(
+                torch.from_numpy(
+                    np.asarray(out_flat).reshape(out_rows, out_cols)
+                ).to(self.device, dtype=self.model_config.dtype)
+            )
+        door_seconds = time.monotonic() - door_started
+        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
         normed = self._tapid_text_model().norm(out)
         if isinstance(normed, tuple):
             normed = normed[0]
 
         self._tapid_steps += 1
         if self._tapid_steps % _TAPID_PREFILL_LOG_EVERY == 1:
+            per_batch = " ".join(f"{x:.3f}" for x in arrivals)
             logger.info(
-                "TAPID prefill #%d: rows=%d reqs=%d request_id=%#x "
-                "door=%.4fs (%.0f tok/s)",
-                self._tapid_steps, rows, num_reqs, request_id, door_seconds,
+                "TAPID prefill #%d: rows=%d reqs=%d door=%.4fs "
+                "(submit=%.4fs batches=[%s]) (%.0f tok/s)",
+                self._tapid_steps, rows, num_reqs, door_seconds,
+                submit_seconds, per_batch,
                 rows / door_seconds if door_seconds > 0 else 0,
             )
         # Diagnostic for the post-prefill sampling hang: a stream-scoped drain

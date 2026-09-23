@@ -82,10 +82,12 @@ def main() -> int:
         "--bench-parallel",
         type=int,
         default=0,
-        help="Concurrent requests per parallel round (e.g. 4). vLLM merges "
-        "the requests into one prefill step (rows=4xL in the door= line), "
-        "bounded by the 2560-row TAPID buffer: 4x1024 arrives as two "
-        "merged steps of 2048 rows. 0 = serial only.",
+        help="Concurrent requests per parallel round (e.g. 4). The door "
+        "submits each request as its OWN TAPID batch (separate input "
+        "buffer/terminal), all queued before any fetch, so the pipelines "
+        "overlap inside the kernel. The scheduler budget must admit all N "
+        "requests in one step: run with --max-model-len >= N x the largest "
+        "length. 0 = serial only.",
     )
     parser.add_argument(
         "--verify", action="store_true",
@@ -108,13 +110,6 @@ def main() -> int:
         args.max_num_batched_tokens = args.max_model_len
     if args.bench_tokens and args.bench_parallel > 0:
         args.max_num_seqs = max(args.max_num_seqs, args.bench_parallel)
-        if not args.no_tapid:
-            # TAPID's row buffer caps one merged prefill at 2560 rows; a
-            # larger scheduler budget makes the runner raise instead of
-            # splitting the batch.
-            args.max_num_batched_tokens = min(
-                args.max_num_batched_tokens, 2560
-            )
     if args.verify or args.state_audit or args.probe != "full":
         print(
             "NOTE: --verify/--probe/--state-audit are ignored by the "
@@ -209,7 +204,7 @@ def main() -> int:
                         f"BENCH parallel w={args.bench_parallel} length={n} "
                         f"rep={rep}: wall={wall:.3f}s "
                         f"({total / wall:.0f} tok/s incl. overhead); "
-                        f"see door= lines for the merged rows="
+                        f"see door= lines for per-request batch arrivals"
                     )
         return 0
 
