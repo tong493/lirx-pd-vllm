@@ -1028,7 +1028,13 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 f"TAPID decode: slot {slot} mailbox returned {out_cols} "
                 "columns, expected the head SOP's [T, 2]"
             )
-        return [int(payload[i * 2 + 1]) for i in range(out_rows)]
+        # The head SOP's terminal [T, 2] carries one row per position: for a
+        # prefill entry T == prompt rows (argmax at each position), for a
+        # decode entry T == 1. Only the LAST row is the step's sampled token
+        # — the same row the device daemon's done_token reads. Taking row 0
+        # would report the position-0 argmax plus every prompt position's
+        # argmax as "generated" tokens.
+        return [int(payload[(out_rows - 1) * 2 + 1])]
 
     def _tapid_next_token(self, slot: int, *, first: bool) -> int:
         buf = self._tapid_pending.get(slot)
