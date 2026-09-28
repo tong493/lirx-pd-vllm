@@ -219,6 +219,10 @@ def main() -> int:
         # 80GB A100 that collides with TAPID's arena+pools. Limits of 0 make
         # the encoder budget empty, so encoder profiling is skipped.
         limit_mm_per_prompt={"image": 0, "video": 0},
+        # The offline LLM entrypoint defaults disable_log_stats=True
+        # (vllm/entrypoints/llm.py), which leaves RequestOutput.metrics as
+        # None; re-enable it so the TIMING lines have engine-core timestamps.
+        disable_log_stats=False,
         additional_config=additional_config,
     )
     if args.bench_tokens:
