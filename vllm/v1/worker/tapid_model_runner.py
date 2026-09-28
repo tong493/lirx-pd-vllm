@@ -648,11 +648,19 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         """Validate the scheduled batch; return (rows, num_reqs, bounds, computed).
 
         Everything comes from the forward context's attention metadata as
-        host-side reads (``query_start_loc.cpu()`` and ``.item()`` are plain
-        memcpys) — no kernel launches, which are the dangerous ones once the
-        persistent kernel is resident. computed[i] is how many tokens of
-        request i were already computed: 0 for a fresh prefill, >0 for the
-        decode steps decode mode tolerates (the daemon owns those rows).
+        host-side reads (``query_start_loc.cpu()`` is a plain memcpy) — no
+        kernel launches, which are the dangerous ones once the persistent
+        kernel is resident. computed[i] is how many tokens of request i were
+        already computed: 0 for a fresh prefill, >0 for the decode steps
+        decode mode tolerates (the daemon owns those rows).
+
+        computed must come from ``seq_lens_cpu_upper_bound`` (= num_computed
+        + num_scheduled, built host-side from the scheduler-fed
+        num_computed_tokens_np), NOT from batch_md.seq_lens: that one is
+        written by the prepare_pos_seq_lens GPU kernel from
+        req_states.num_computed_tokens.gpu, which decode mode leaves stale
+        (the sampler bypass skips postprocess_num_computed_tokens), so it
+        reads 0 + query_len for decode steps.
         """
         context = get_forward_context()
         metadata_map = context.attn_metadata
@@ -689,6 +697,9 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 f"per step, got {num_reqs}"
             )
         rows = int(query_start_loc[-1].item())
+        upper = batch_md.seq_lens_cpu_upper_bound
+        if upper is not None:
+            upper = upper.cpu()[:num_reqs]
         seq_lens = batch_md.seq_lens.cpu()
         max_rows = self.tapid_adapter.MAX_PREFILL_TOKENS
         bounds = []
@@ -696,7 +707,10 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         for i in range(num_reqs):
             start = int(query_start_loc[i])
             end = int(query_start_loc[i + 1])
-            computed = int(seq_lens[i]) - (end - start)
+            if upper is not None:
+                computed = int(upper[i]) - (end - start)
+            else:
+                computed = int(seq_lens[i]) - (end - start)
             if computed != 0 and not self.tapid_decode:
                 hint = (
                     "decode step"
@@ -1048,6 +1062,12 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             slot = self._tapid_req_slot.get(req_id)
             if slot is not None:
                 self._tapid_release_slot(req_id, slot)
+
+        # Advance req_states.num_computed_tokens.gpu the way the normal
+        # sampler's postprocess does; bypassing it left the GPU buffer at its
+        # add_request value, so the next step's prepare_pos_seq_lens computed
+        # seq_len == query_len (decode steps looked like fresh prefills).
+        self.postprocess_num_computed_tokens(input_batch)
 
         output = ModelRunnerOutput(
             req_ids=req_ids,
