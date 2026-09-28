@@ -258,20 +258,38 @@ def main() -> int:
         args.prompt or ["The capital of France is"],
         SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
     )
+    dumps = []
     for o in out:
         print("PROMPT:", o.prompt)
         print("OUTPUT:", o.outputs[0].text)
+        # RequestStateStats timestamps (engine-core monotonic clock, attached
+        # by output_processor): queue/prefill/decode split per request.
+        m = o.metrics
+        n = len(o.outputs[0].token_ids)
+        if m is None:
+            print("TIMING: (unavailable — log_stats disabled)")
+            continue
+        queue = m.scheduled_ts - m.queued_ts
+        prefill = m.first_token_ts - m.scheduled_ts
+        decode = m.last_token_ts - m.first_token_ts
+        infer = m.last_token_ts - m.scheduled_ts
+        rate = (n - 1) / decode if n > 1 and decode > 0 else float("nan")
+        print(
+            f"TIMING: tokens={n} queue={queue * 1e3:.1f}ms "
+            f"ttft={prefill * 1e3:.1f}ms decode={decode * 1e3:.1f}ms "
+            f"infer={infer * 1e3:.1f}ms ({rate:.1f} tok/s)"
+        )
+        dumps.append(
+            {"prompt": o.prompt,
+             "token_ids": list(o.outputs[0].token_ids),
+             "text": o.outputs[0].text,
+             "timing_ms": {"queue": queue * 1e3, "ttft": prefill * 1e3,
+                           "decode": decode * 1e3, "infer": infer * 1e3,
+                           "tokens": n}}
+        )
     if args.dump_tokens:
         import json
-        json.dump(
-            [
-                {"prompt": o.prompt,
-                 "token_ids": list(o.outputs[0].token_ids),
-                 "text": o.outputs[0].text}
-                for o in out
-            ],
-            open(args.dump_tokens, "w"),
-        )
+        json.dump(dumps, open(args.dump_tokens, "w"))
         print(f"tokens -> {args.dump_tokens}")
     return 0
 
