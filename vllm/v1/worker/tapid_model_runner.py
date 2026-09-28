@@ -244,6 +244,9 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self._tapid_req_slot: dict[Any, int] = {}
         self._tapid_pending: dict[int, list[int]] = {}
         self._tapid_awaiting_first: set[int] = set()
+        # Slots whose device loop reached EOS/budget: the daemon stopped
+        # feeding, so no further mailbox entries will ever arrive for them.
+        self._tapid_done_slots: set[int] = set()
         self._tapid_generated: dict[int, int] = {}
         self._tapid_step_slots: list[int | None] = []
         # The real-step InputBatch, stashed by the prepare_attn hook below:
@@ -984,6 +987,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self.tapid_session.kv_release(slot)
         self._tapid_req_slot.pop(req_id, None)
         self._tapid_awaiting_first.discard(slot)
+        self._tapid_done_slots.discard(slot)
         self._tapid_pending.pop(slot, None)
         self._tapid_generated.pop(slot, None)
         self._tapid_slot_free.append(slot)
@@ -1037,6 +1041,15 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         return [int(payload[(out_rows - 1) * 2 + 1])]
 
     def _tapid_next_token(self, slot: int, *, first: bool) -> int:
+        if slot in self._tapid_done_slots:
+            # Device loop finished: nothing will ever be published again.
+            # Async scheduling optimistically over-schedules one step past a
+            # finish token (output placeholders); that ghost step must return
+            # instantly or its fetch blocks the scheduler's finish
+            # reconciliation until the fetch timeout. Reply with the same
+            # finish token — the scheduler marks the stale output and drops
+            # it.
+            return self._tapid_eos_id
         buf = self._tapid_pending.get(slot)
         if buf:
             return buf.pop(0)
@@ -1095,6 +1108,11 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             token = self._tapid_next_token(slot, first=first)
             if first:
                 self._tapid_awaiting_first.discard(slot)
+            if token == self._tapid_eos_id:
+                # The daemon stops feeding on EOS — remember it so any
+                # over-scheduled ghost step returns instantly (see
+                # _tapid_next_token).
+                self._tapid_done_slots.add(slot)
             self._tapid_generated[slot] = self._tapid_generated.get(slot, 0) + 1
             logger.info(
                 "TAPID decode: slot %d token #%d = %d%s",
