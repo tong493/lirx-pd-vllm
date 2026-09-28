@@ -1102,11 +1102,14 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             if slot is not None:
                 self._tapid_release_slot(req_id, slot)
 
-        # Advance req_states.num_computed_tokens.gpu the way the normal
-        # sampler's postprocess does; bypassing it left the GPU buffer at its
-        # add_request value, so the next step's prepare_pos_seq_lens computed
-        # seq_len == query_len (decode steps looked like fresh prefills).
-        self.postprocess_num_computed_tokens(input_batch)
+        # NOTE: deliberately NOT calling postprocess_num_computed_tokens
+        # here. Nothing reads req_states.num_computed_tokens.gpu on the
+        # decode path (classification uses the slot map + num_computed_
+        # tokens_np), and the first post-arm run of that postprocess kernel
+        # has to JIT + cuModuleLoadData — a context-wide module load, which
+        # deadlocks against the resident persistent kernel (observed on
+        # cloud: hang right after the JIT warning). Never introduce a
+        # host-side op post-arm that warmup did not already exercise.
 
         output = ModelRunnerOutput(
             req_ids=req_ids,
