@@ -2,8 +2,13 @@
 
 Prefill-only door (see gpu_daemon/docs/vllm_integration.md): TAPID holds the
 only full copy of the decoder weights and runs the 64-layer prefill program;
-vLLM keeps the skeleton (embed / final norm / lm_head) and samples. Decode is
-out of scope — measure prefill with --max-tokens 1.
+vLLM keeps the skeleton (embed / final norm / lm_head) and samples. Without
+--decode, measure prefill with --max-tokens 1.
+
+With --decode (issue #190): TAPID additionally arms the device-side decode
+loop — prefill ends at the head SOP ([T, 2] token mailbox), the first token
+feeds back ON DEVICE, and the persistent kernel generates until eos or
+budget. vLLM only drains tokens and detokenizes; sampling is greedy argmax.
 """
 
 from __future__ import annotations
@@ -55,8 +60,18 @@ def main() -> int:
         "--max-tokens",
         type=int,
         default=1,
-        help="Tokens to sample per prompt. The TAPID path refuses decode "
-        "steps, so anything above 1 fails after the prefill.",
+        help="Tokens to sample per prompt. 1 measures prefill only. >1 "
+        "requires --decode (device-side decode loop, greedy argmax).",
+    )
+    parser.add_argument(
+        "--decode",
+        action="store_true",
+        help="Arm TAPID's device-side decode loop (issue #190): prefill "
+        "lands the first token via the head SOP, the persistent kernel "
+        "feeds it back on device and keeps generating until eos or budget. "
+        "Sampling is greedy argmax ON DEVICE — temperature/top-p are "
+        "ignored; requires untied embeddings and --max-num-seqs <= 8 "
+        "(the terminal pool is the slot pool).",
     )
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument(
@@ -139,10 +154,17 @@ def main() -> int:
             "prefill-only TAPID door.",
             file=sys.stderr,
         )
-    if args.max_tokens > 1:
+    decode_mode = args.decode or (not args.no_tapid and args.max_tokens > 1)
+    if decode_mode and args.no_tapid:
+        parser.error("--decode has no effect with --no-tapid")
+    if decode_mode and args.bench_tokens:
+        parser.error(
+            "--bench-tokens measures prefill only; drop it for decode runs"
+        )
+    if decode_mode:
         print(
-            "NOTE: --max-tokens > 1 will fail on the first decode step; the "
-            "TAPID door measures prefill only.",
+            "TAPID decode mode: greedy argmax ON DEVICE (temperature/top-p "
+            "ignored); slots = terminal pool (8), one request per slot.",
             file=sys.stderr,
         )
 
@@ -176,6 +198,7 @@ def main() -> int:
         else {
             "tapid": {
                 "model_signature": "qwen3_5_dense_27b_bf16",
+                "decode": decode_mode,
             }
         }
     )

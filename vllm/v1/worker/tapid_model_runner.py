@@ -11,10 +11,16 @@ Contract (see gpu_daemon/docs/vllm_integration.md in the TAPID repo):
 * Only TAPID's host-side instructions are called (``tapid_vllm`` ->
   pyshim C ABI): open, bind, launch, set_program, submit (F32), fetch. No
   runtime/KV-cache binding: the submit/fetch path owns its device buffers.
-* Prefill only. The program boundary is the decoder output; vLLM applies the
-  final norm and samples. Decode, chunked prefill, and multi-request batches
-  are refused with explicit errors — with the decoder weights freed there is
-  no vLLM fallback either.
+* Prefill only, unless decode mode is on (``additional_config["tapid"]["decode"]``).
+  Decode mode arms TAPID's device-side decode loop (issue #190): prefill runs
+  the output_head program (terminal output [1, 2] = sampled token id), the
+  generated token feeds back to the entry stage ON DEVICE, and the daemon
+  keeps producing tokens until eos or budget. vLLM's sampler is bypassed —
+  the token the host reports is the one the device sampled. Decode sequences
+  submit under request_id == slot; the slot pool and per-slot KV regions are
+  TAPID's own (kv_alloc/kv_release), allocated BEFORE the prefill is
+  submitted. Decode steps are never submitted: the runner only drains
+  produced tokens via fetch_with_token_ids.
 
 Model specifics (checkpoint conversion, program assembly, skeleton names) live
 in the TAPID repo's model assembly package; nothing here knows the model.
@@ -54,6 +60,11 @@ _TAPID_FETCH_TIMEOUT_MS = 600_000
 # (tapid_debug_dump, twice — what did not move is the stall) before raising.
 _TAPID_FETCH_CHUNK_MS = 30_000
 _TAPID_DUMP_GAP_S = 5.0
+# Decode-mode mailbox waits: a healthy daemon answers a decode step in
+# milliseconds, so the chunk is short and the heartbeat frequent; the total
+# deadline only exists to convert a wedged device loop into a loud error.
+_TAPID_DECODE_CHUNK_MS = 5_000
+_TAPID_DECODE_TIMEOUT_MS = 120_000
 
 # Pre-arm the fetch can block far longer than a decode step ever would; a
 # hung prefill surfaces as this timeout, not as a silent wedge.
@@ -70,6 +81,18 @@ def validate_tapid_config(runner: Any) -> None:
     tapid_config = runner.vllm_config.additional_config["tapid"]
     if tapid_config.get("model_signature") != "qwen3_5_dense_27b_bf16":
         raise ValueError("TAPID requires the Qwen3.5 27B BF16 signature")
+    runner.tapid_decode = bool(tapid_config.get("decode", False))
+    if runner.tapid_decode:
+        if os.environ.get("TAPID_SKIP_LM_HEAD") == "1":
+            raise ValueError(
+                "TAPID decode mode samples on device (head SOP argmax); "
+                "TAPID_SKIP_LM_HEAD=1 is meaningless and forbidden here"
+            )
+        if runner.model_config.hf_text_config.tie_word_embeddings:
+            raise ValueError(
+                "TAPID decode mode binds lm_head INSIDE TAPID "
+                "(load_decode_tail_weights), which needs untied embeddings"
+            )
     if not runner.model_config.enforce_eager:
         raise ValueError("TAPID requires enforce_eager")
     if runner.model_config.hf_text_config.model_type != "qwen3_5_text":
@@ -212,6 +235,19 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self._tapid_hidden_size = self.model_config.get_hidden_size()
         self._tapid_next_request = 0
         self._tapid_steps = 0
+        # Decode mode (issue #190). Slots are TAPID-side: request_id == slot
+        # for decode sequences, kv_alloc before the prefill submit, kv_release
+        # when vLLM finishes the request. Drained tokens buffer per slot
+        # because the daemon produces on device while the engine steps at its
+        # own cadence — one token is reported per engine step.
+        self._tapid_slot_free: list[int] = []
+        self._tapid_req_slot: dict[Any, int] = {}
+        self._tapid_pending: dict[int, list[int]] = {}
+        self._tapid_awaiting_first: set[int] = set()
+        self._tapid_generated: dict[int, int] = {}
+        self._tapid_step_slots: list[int | None] = []
+        self._tapid_eos_id = 0
+        self._tapid_max_len = 0
 
     # ---- model load: the single weight copy -------------------------------
 
@@ -335,6 +371,15 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         """
         started = time.monotonic()
         weights = self.tapid_adapter.load_decoder_weights(self.model_config.model)
+        if self.tapid_decode:
+            # Final norm + lm_head + embed table must live INSIDE TAPID: the
+            # output_head program executes them on device and the decode loop
+            # gathers fed-token rows from the embed binding itself.
+            tail = self.tapid_adapter.load_decode_tail_weights(
+                self.model_config.model
+            )
+            logger.info("TAPID decode: binding %d decode-tail weights", len(tail))
+            weights = weights + tail
         # Keepalive for the host tensors the upload borrows.
         self._tapid_decoder_weights = weights
         self.tapid_session = self.tapid_door.TapidVllmSession([self.device.index])
@@ -439,11 +484,13 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         time.sleep(0.3)
         logger.info("TAPID: launch returned in %.2fs", time.monotonic() - started)
         payload = self.tapid_adapter.decoder_program_payload(
-            self.tapid_session.abi
+            self.tapid_session.abi, output_head=self.tapid_decode
         )
         self.tapid_session.set_program(
             payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
         )
+        if self.tapid_decode:
+            self._configure_tapid_decode()
         self.tapid_armed = True
         if os.environ.get("TAPID_SKIP_LM_HEAD") == "1":
             self._install_fake_logits()
@@ -451,6 +498,50 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             "TAPID armed: persistent prefill program resident (%.1fs)",
             time.monotonic() - started,
         )
+
+    def _configure_tapid_decode(self) -> None:
+        """Arm kv_cache_mgr + the decode-loop daemon (issue #190).
+
+        max_slots is the terminal pool size (MAX_DECODE_SLOTS == N_TERMINAL in
+        the compiled binary) — the decode daemon reads the head SOP's [1, 2]
+        mailbox entries through that pool, so a decode sequence must submit
+        under request_id == slot. The budget handed to kv_alloc is the region
+        limit (max_model_len - prompt_len); vLLM stops the request at its own
+        max_tokens earlier, and the extra budget only means the daemon would
+        have kept going — drained tokens for a released slot are discarded.
+        """
+        from tapid.bench.abi import N_TERMINAL
+
+        max_slots = int(self.tapid_session.abi[N_TERMINAL])
+        if self.scheduler_config.max_num_seqs > max_slots:
+            raise ValueError(
+                f"max_num_seqs={self.scheduler_config.max_num_seqs} exceeds "
+                f"the decode slot pool ({max_slots} = N_TERMINAL); lower "
+                "--max-num-seqs"
+            )
+        self._tapid_eos_id = self._tapid_resolve_eos()
+        self._tapid_max_len = self.model_config.max_model_len
+        self.tapid_adapter.configure_decode(
+            self.tapid_session,
+            max_slots=max_slots,
+            max_len=self._tapid_max_len,
+            eos_id=self._tapid_eos_id,
+        )
+        self._tapid_slot_free = list(range(max_slots))
+        logger.info(
+            "TAPID decode: %d slots armed, max_len=%d, eos_id=%d",
+            max_slots, self._tapid_max_len, self._tapid_eos_id,
+        )
+
+    def _tapid_resolve_eos(self) -> int:
+        eos = getattr(self.model_config.hf_config, "eos_token_id", None)
+        if isinstance(eos, list):
+            eos = eos[0] if eos else None
+        if eos is None:
+            eos = getattr(
+                self.model_config.hf_text_config, "eos_token_id", 0
+            )
+        return int(eos or 0)
 
     def _install_fake_logits(self) -> None:
         """BENCH ONLY: replace the lm_head GEMM with a zeros tensor.
@@ -492,6 +583,8 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         finishes each request immediately) so the scheduler can line up the
         next prefill while the persistent kernel stays resident.
         """
+        if self.tapid_armed and self.tapid_decode:
+            return self._decode_sample_tokens()
         if not self._bench_sampling_skipped():
             return super().sample_tokens(grammar_output)
         state = self.execute_model_state
@@ -522,6 +615,8 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     ) -> Any:
         if not self.tapid_armed:
             return self._stub_forward(input_ids, inputs_embeds)
+        if self.tapid_decode:
+            return self._tapid_decode_forward(input_ids, inputs_embeds)
         return self._tapid_prefill_forward(input_ids, inputs_embeds)
 
     def _stub_forward(
@@ -549,13 +644,15 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             normed = normed[0]
         return normed.to(self.model_config.dtype)
 
-    def _prefill_batch(self) -> tuple[int, Any]:
-        """Validate the scheduled batch is one fresh prefill; return (rows, md).
+    def _prefill_batch(self) -> tuple[int, int, list, list[int]]:
+        """Validate the scheduled batch; return (rows, num_reqs, bounds, computed).
 
         Everything comes from the forward context's attention metadata as
         host-side reads (``query_start_loc.cpu()`` and ``.item()`` are plain
         memcpys) — no kernel launches, which are the dangerous ones once the
-        persistent kernel is resident.
+        persistent kernel is resident. computed[i] is how many tokens of
+        request i were already computed: 0 for a fresh prefill, >0 for the
+        decode steps decode mode tolerates (the daemon owns those rows).
         """
         context = get_forward_context()
         metadata_map = context.attn_metadata
@@ -595,11 +692,12 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         seq_lens = batch_md.seq_lens.cpu()
         max_rows = self.tapid_adapter.MAX_PREFILL_TOKENS
         bounds = []
+        computed_list: list[int] = []
         for i in range(num_reqs):
             start = int(query_start_loc[i])
             end = int(query_start_loc[i + 1])
             computed = int(seq_lens[i]) - (end - start)
-            if computed != 0:
+            if computed != 0 and not self.tapid_decode:
                 hint = (
                     "decode step"
                     if end - start == 1
@@ -617,14 +715,15 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                     f"outside (0, {max_rows}]"
                 )
             bounds.append((start, end))
-        return rows, num_reqs, bounds
+            computed_list.append(computed)
+        return rows, num_reqs, bounds, computed_list
 
     def _tapid_prefill_forward(
         self,
         input_ids: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
     ) -> Any:
-        rows, num_reqs, bounds = self._prefill_batch()
+        rows, num_reqs, bounds, _computed = self._prefill_batch()
         if inputs_embeds is not None:
             hidden = inputs_embeds
         elif input_ids is not None:
@@ -743,6 +842,226 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         )
         return normed
 
+    # ---- decode mode (issue #190) ------------------------------------------
+
+    def _tapid_decode_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> Any:
+        """Decode-mode forward: submit fresh prefills, ignore decode rows.
+
+        Fresh prefills (computed == 0) arm a slot (kv_alloc BEFORE submit —
+        the prefill's qk_norm_rope commits K/V into the slot's regions at the
+        sidecar positions) and submit the embedded hidden rows under
+        request_id == slot; the program's head stage lands the first sampled
+        token in the slot's terminal mailbox. Decode rows (1 row, computed>0)
+        are NEVER submitted: the device-side decode loop is already producing
+        that request's tokens autonomously; this row exists only so vLLM's
+        scheduler bookkeeping advances. The return value is a dummy tensor —
+        _decode_sample_tokens below replaces the sampler entirely.
+        """
+        rows, num_reqs, bounds, computed_list = self._prefill_batch()
+        if inputs_embeds is not None:
+            hidden = inputs_embeds
+        elif input_ids is not None:
+            hidden = self.model.embed_input_ids(input_ids)
+        else:
+            raise RuntimeError(
+                "TAPID decode forward requires token ids or input embeddings"
+            )
+        if hidden.shape[0] < rows or hidden.shape[1] != self._tapid_hidden_size:
+            raise RuntimeError(
+                f"embedded hidden {tuple(hidden.shape)} cannot carry {rows} "
+                f"rows of width {self._tapid_hidden_size}"
+            )
+
+        step_slots: list[int | None] = []
+        n_prefills = 0
+        for i, (start, end) in enumerate(bounds):
+            if computed_list[i] != 0:
+                if end - start != 1:
+                    raise RuntimeError(
+                        f"TAPID decode request {i} scheduled {end - start} "
+                        f"rows with {computed_list[i]} computed — chunked "
+                        "prefill is unsupported"
+                    )
+                step_slots.append(None)     # decode row: daemon owns it
+                continue
+            slot = self._tapid_acquire_slot()
+            prompt_len = end - start
+            # Budget up to the region limit; vLLM finishes the request at its
+            # own max_tokens (or eos) earlier and the slot is released then.
+            budget = max(1, self._tapid_max_len - prompt_len)
+            self.tapid_session.kv_alloc(slot, prompt_len, budget)
+            self.tapid_session.submit_hidden(
+                slot, hidden[start:end], self._tapid_hidden_size
+            )
+            step_slots.append(slot)
+            n_prefills += 1
+        self._tapid_step_slots = step_slots
+        if n_prefills:
+            logger.info(
+                "TAPID decode: submitted %d prefill(s) slots=%s rows=%d",
+                n_prefills,
+                [s for s in step_slots if s is not None],
+                rows,
+            )
+        # execute_model asserts a Tensor return; nothing torch-side reads it.
+        return torch.zeros(
+            (input_ids.shape[0], self._tapid_hidden_size),
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
+
+    def _tapid_acquire_slot(self) -> int:
+        if not self._tapid_slot_free:
+            raise RuntimeError(
+                "TAPID decode: no free slots (all "
+                f"{len(self._tapid_req_slot)} occupied); raise --max-num-seqs "
+                "limits or wait for requests to finish"
+            )
+        return self._tapid_slot_free.pop()
+
+    def _tapid_release_slot(self, req_id: Any, slot: int) -> None:
+        logger.info(
+            "TAPID decode: releasing slot %d (req %s, %d tokens)",
+            slot, req_id, self._tapid_generated.get(slot, 0),
+        )
+        self.tapid_session.kv_release(slot)
+        self._tapid_req_slot.pop(req_id, None)
+        self._tapid_awaiting_first.discard(slot)
+        self._tapid_pending.pop(slot, None)
+        self._tapid_generated.pop(slot, None)
+        self._tapid_slot_free.append(slot)
+
+    def _tapid_fetch_tokens(self, slot: int, *, first: bool) -> list[int]:
+        """Drain one slot's terminal mailbox into token ids (col 1 of [T, 2])."""
+        n_expect = self._tapid_max_len * 2 + 8
+        deadline = time.monotonic() + (
+            _TAPID_FETCH_TIMEOUT_MS if first else _TAPID_DECODE_TIMEOUT_MS
+        ) / 1000.0
+        chunk = _TAPID_FETCH_CHUNK_MS if first else _TAPID_DECODE_CHUNK_MS
+        while True:
+            try:
+                payload, out_rows, out_cols, _mirrors = (
+                    self.tapid_session.fetch_with_token_ids(
+                        slot, n_expect, timeout_ms=chunk
+                    )
+                )
+                break
+            except self.tapid_door.TapidError as exc:
+                if "timed out" not in str(exc):
+                    raise
+                now = time.monotonic()
+                if now >= deadline:
+                    logger.error(
+                        "TAPID decode: slot %d produced no %s after %.0fs — "
+                        "dumping device state",
+                        slot, "first token" if first else "tokens",
+                        now - deadline + (
+                            _TAPID_FETCH_TIMEOUT_MS if first
+                            else _TAPID_DECODE_TIMEOUT_MS
+                        ) / 1000.0,
+                    )
+                    self._dump_tapid_stall(f"decode fetch slot={slot}")
+                    raise
+                logger.info(
+                    "TAPID decode: still waiting for slot %d (%s)",
+                    slot, "first token" if first else "next tokens",
+                )
+        if out_cols != 2:
+            raise RuntimeError(
+                f"TAPID decode: slot {slot} mailbox returned {out_cols} "
+                "columns, expected the head SOP's [T, 2]"
+            )
+        return [int(payload[i * 2 + 1]) for i in range(out_rows)]
+
+    def _tapid_next_token(self, slot: int, *, first: bool) -> int:
+        buf = self._tapid_pending.get(slot)
+        if buf:
+            return buf.pop(0)
+        tokens = self._tapid_fetch_tokens(slot, first=first)
+        if not tokens:
+            raise RuntimeError(
+                f"TAPID decode: slot {slot} drained an empty mailbox entry"
+            )
+        head, *rest = tokens
+        if rest:
+            self._tapid_pending[slot] = rest
+        return head
+
+    def _decode_sample_tokens(self) -> Any:
+        """Replace the sampler: report device-sampled tokens to the engine.
+
+        Per engine step every scheduled request gets exactly one token: fresh
+        prefills block for their head output (the prefill itself is the wait),
+        decode rows pop the daemon's next token (backlog from earlier drains
+        first, then a fresh fetch). Requests the scheduler finished have
+        their slot released here — kv_release stops the device loop, and any
+        tokens still buffered for them are discarded.
+        """
+        state = self.execute_model_state
+        self.execute_model_state = None
+        input_batch = state.input_batch
+        req_ids = list(input_batch.req_ids)
+        step_slots = self._tapid_step_slots
+        self._tapid_step_slots = []
+        if len(step_slots) != len(req_ids):
+            raise RuntimeError(
+                f"TAPID decode: step slot map has {len(step_slots)} entries "
+                f"for {len(req_ids)} requests — forward/sampler desync"
+            )
+        for req_id, slot in zip(req_ids, step_slots):
+            if slot is not None:
+                if req_id in self._tapid_req_slot:
+                    raise RuntimeError(
+                        f"TAPID decode: request {req_id} prefilled twice"
+                    )
+                self._tapid_req_slot[req_id] = slot
+                self._tapid_awaiting_first.add(slot)
+
+        sampled: list[list[int]] = []
+        for req_id, fresh_slot in zip(req_ids, step_slots):
+            slot = fresh_slot
+            first = False
+            if slot is None:
+                slot = self._tapid_req_slot.get(req_id)
+            else:
+                first = slot in self._tapid_awaiting_first
+            if slot is None:
+                raise RuntimeError(
+                    f"TAPID decode: request {req_id} has no slot this step"
+                )
+            token = self._tapid_next_token(slot, first=first)
+            if first:
+                self._tapid_awaiting_first.discard(slot)
+            self._tapid_generated[slot] = self._tapid_generated.get(slot, 0) + 1
+            logger.info(
+                "TAPID decode: slot %d token #%d = %d%s",
+                slot, self._tapid_generated[slot], token,
+                " (prefill)" if first else "",
+            )
+            sampled.append([token])
+
+        for req_id in list(state.finished_req_ids or ()):
+            slot = self._tapid_req_slot.get(req_id)
+            if slot is not None:
+                self._tapid_release_slot(req_id, slot)
+
+        output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={
+                req_id: i for i, req_id in enumerate(req_ids)
+            },
+            sampled_token_ids=sampled,
+            prompt_logprobs_dict={},
+        )
+        output.kv_connector_output = self.kv_connector.post_forward(
+            state.finished_req_ids
+        )
+        return output
+
     def _dump_tapid_stall(self, where: str) -> None:
         """Device-side hang snapshot, twice: what did not move is the stall.
 
@@ -771,6 +1090,14 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     def _close_tapid_session(self) -> None:
         self.tapid_armed = False
         if self.tapid_session is not None:
+            # Best-effort slot teardown; close() would free the device state
+            # anyway, but an explicit release keeps the audit log honest.
+            for req_id, slot in list(self._tapid_req_slot.items()):
+                try:
+                    self._tapid_release_slot(req_id, slot)
+                except Exception as exc:      # noqa: BLE001
+                    logger.warning("TAPID: slot %d release failed: %s", slot, exc)
+            self._tapid_slot_free = []
             # close() stops the persistent kernels, so a real device sync is
             # legal again — and vLLM's own shutdown path needs one.
             self.tapid_session.close()
