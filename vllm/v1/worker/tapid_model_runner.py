@@ -246,6 +246,14 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self._tapid_awaiting_first: set[int] = set()
         self._tapid_generated: dict[int, int] = {}
         self._tapid_step_slots: list[int | None] = []
+        # The real-step InputBatch, stashed by the prepare_attn hook below:
+        # the only reliable per-step request state (req_ids and the
+        # scheduler-fed num_computed_tokens_np in batch order). The forward
+        # context's attention metadata is backend-specific (FlashAttention
+        # metadata here) and its seq_lens is GPU-side, fed by
+        # req_states.num_computed_tokens.gpu — which decode mode leaves stale.
+        self._tapid_input_batch: Any = None
+        self._tapid_step_req_ids: list[Any] = []
         self._tapid_eos_id = 0
         self._tapid_max_len = 0
 
@@ -604,6 +612,16 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         )
         return output
 
+    def prepare_attn(self, input_batch: Any) -> Any:
+        """Stash the real-step InputBatch before the backend builds metadata.
+
+        The TAPID forward paths need req_ids and num_computed_tokens_np in
+        batch order; the forward context only exposes backend metadata
+        (FlashAttentionMetadata here), which carries neither.
+        """
+        self._tapid_input_batch = input_batch
+        return super().prepare_attn(input_batch)
+
     # ---- forwards ----------------------------------------------------------
     def _model_forward(
         self,
@@ -647,20 +665,20 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     def _prefill_batch(self) -> tuple[int, int, list, list[int]]:
         """Validate the scheduled batch; return (rows, num_reqs, bounds, computed).
 
-        Everything comes from the forward context's attention metadata as
-        host-side reads (``query_start_loc.cpu()`` is a plain memcpy) — no
-        kernel launches, which are the dangerous ones once the persistent
-        kernel is resident. computed[i] is how many tokens of request i were
-        already computed: 0 for a fresh prefill, >0 for the decode steps
-        decode mode tolerates (the daemon owns those rows).
+        Everything comes from host-side reads (``query_start_loc.cpu()`` is
+        a plain memcpy) — no kernel launches, which are the dangerous ones
+        once the persistent kernel is resident. computed[i] is how many
+        tokens of request i were already computed: 0 for a fresh prefill,
+        >0 for the decode steps decode mode tolerates (the daemon owns
+        those rows).
 
-        computed must come from ``seq_lens_cpu_upper_bound`` (= num_computed
-        + num_scheduled, built host-side from the scheduler-fed
-        num_computed_tokens_np), NOT from batch_md.seq_lens: that one is
-        written by the prepare_pos_seq_lens GPU kernel from
-        req_states.num_computed_tokens.gpu, which decode mode leaves stale
-        (the sampler bypass skips postprocess_num_computed_tokens), so it
-        reads 0 + query_len for decode steps.
+        computed comes from the stashed InputBatch's num_computed_tokens_np
+        (batch order, refreshed from the scheduler by update_requests).
+        batch_md.seq_lens must NOT be used: it is written by the
+        prepare_pos_seq_lens GPU kernel from req_states.num_computed_tokens
+        .gpu, which decode mode leaves stale (the sampler bypass skips
+        postprocess_num_computed_tokens), so it reads 0 + query_len for
+        decode steps.
         """
         context = get_forward_context()
         metadata_map = context.attn_metadata
@@ -697,20 +715,26 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 f"per step, got {num_reqs}"
             )
         rows = int(query_start_loc[-1].item())
-        upper = batch_md.seq_lens_cpu_upper_bound
-        if upper is not None:
-            upper = upper.cpu()[:num_reqs]
-        seq_lens = batch_md.seq_lens.cpu()
+        step_batch = self._tapid_input_batch
+        if step_batch is None:
+            raise RuntimeError(
+                "TAPID prefill: no stashed InputBatch — prepare_attn did "
+                "not run for this step"
+            )
+        req_ids = list(step_batch.req_ids)
+        if len(req_ids) != num_reqs:
+            raise RuntimeError(
+                f"TAPID prefill: metadata has {num_reqs} requests but the "
+                f"InputBatch has {len(req_ids)}"
+            )
+        computed_np = step_batch.num_computed_tokens_np
         max_rows = self.tapid_adapter.MAX_PREFILL_TOKENS
         bounds = []
         computed_list: list[int] = []
         for i in range(num_reqs):
             start = int(query_start_loc[i])
             end = int(query_start_loc[i + 1])
-            if upper is not None:
-                computed = int(upper[i]) - (end - start)
-            else:
-                computed = int(seq_lens[i]) - (end - start)
+            computed = int(computed_np[i])
             if computed != 0 and not self.tapid_decode:
                 hint = (
                     "decode step"
@@ -730,6 +754,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 )
             bounds.append((start, end))
             computed_list.append(computed)
+        self._tapid_step_req_ids = req_ids
         return rows, num_reqs, bounds, computed_list
 
     def _tapid_prefill_forward(
@@ -865,15 +890,18 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
     ) -> Any:
         """Decode-mode forward: submit fresh prefills, ignore decode rows.
 
-        Fresh prefills (computed == 0) arm a slot (kv_alloc BEFORE submit —
+        A fresh prefill (first appearance — the request has no slot yet,
+        which only its first scheduled step can be) arms a slot
+        (kv_alloc BEFORE submit —
         the prefill's qk_norm_rope commits K/V into the slot's regions at the
         sidecar positions) and submit the embedded hidden rows under
         request_id == slot; the program's head stage lands the first sampled
-        token in the slot's terminal mailbox. Decode rows (1 row, computed>0)
-        are NEVER submitted: the device-side decode loop is already producing
-        that request's tokens autonomously; this row exists only so vLLM's
-        scheduler bookkeeping advances. The return value is a dummy tensor —
-        _decode_sample_tokens below replaces the sampler entirely.
+        token in the slot's terminal mailbox. Decode rows (an already-armed
+        request's 1-row step) are NEVER submitted: the device-side decode
+        loop is already producing that request's tokens autonomously; this
+        row exists only so vLLM's scheduler bookkeeping advances. The return
+        value is a dummy tensor — _decode_sample_tokens below replaces the
+        sampler entirely.
         """
         rows, num_reqs, bounds, computed_list = self._prefill_batch()
         if inputs_embeds is not None:
@@ -892,16 +920,27 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
 
         step_slots: list[int | None] = []
         n_prefills = 0
+        req_ids = self._tapid_step_req_ids
         for i, (start, end) in enumerate(bounds):
-            if computed_list[i] != 0:
+            if req_ids[i] in self._tapid_req_slot:
+                # Runner-local truth outranks computed here: a request this
+                # runner already armed is a decode row the device daemon
+                # owns, regardless of what the computed bookkeeping says
+                # (the GPU-side copy can lag — see _prefill_batch).
                 if end - start != 1:
                     raise RuntimeError(
                         f"TAPID decode request {i} scheduled {end - start} "
-                        f"rows with {computed_list[i]} computed — chunked "
-                        "prefill is unsupported"
+                        f"rows for an armed request — chunked prefill is "
+                        "unsupported"
                     )
                 step_slots.append(None)     # decode row: daemon owns it
                 continue
+            if computed_list[i] != 0:
+                raise RuntimeError(
+                    f"TAPID decode request {i} scheduled {end - start} "
+                    f"rows with {computed_list[i]} computed — chunked "
+                    "prefill is unsupported"
+                )
             slot = self._tapid_acquire_slot()
             prompt_len = end - start
             # Budget up to the region limit; vLLM finishes the request at its
