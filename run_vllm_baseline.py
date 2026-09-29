@@ -105,7 +105,11 @@ def main() -> int:
             for rep in range(args.bench_reps):
                 prompt = TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
                 t0 = time.perf_counter()
+                # "prefill" NVTX range for nsys/plot_prefill_load.py
+                # (host-side marker only, no GPU-side effect)
+                torch.cuda.nvtx.range_push("prefill")
                 llm.generate([prompt], sampling)
+                torch.cuda.nvtx.range_pop()
                 wall = time.perf_counter() - t0
                 print(
                     f"BASELINE bench length={n} rep={rep}: wall={wall:.3f}s "
