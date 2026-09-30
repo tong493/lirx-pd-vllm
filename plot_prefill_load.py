@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 """Plot prefill SM load from an nsys sqlite export.
 
-Two panels, restricted to one "prefill" NVTX range (default: the last one):
-  top    - SM Active % over time (hardware-sampled GPU metrics)
-  bottom - kernel activity over time. With few launches this is a per-launch
-           gantt (one rectangle per launch, colored by kernel); with many
-           (thousands) the bars would be sub-pixel wide, so it switches to a
-           bucketed kernel-busy-% curve. --gantt forces the gantt view.
+Default: ONE panel — <metric> % over time for a single "prefill" NVTX range
+(default: the last one; --range K selects). In practice the hardware-sampled
+curve and the kernel-derived busy curve track each other, so the kernel view
+(per-launch gantt when a range holds few launches, bucketed kernel-busy-%
+when many) is behind --kernels; --gantt forces the gantt inside that panel.
 
 Per-SM (0..107) lanes are NOT buildable from this data: the sqlite export
 carries device-wide GPU metrics and per-kernel records only, no per-SM
@@ -20,8 +19,10 @@ Usage on the A100 box:
            python run_vllm_baseline.py --model <dir> --bench-tokens 1024 ...
   2. nsys export --type sqlite -o prefill.sqlite prefill.nsys-rep
   3. python plot_prefill_load.py prefill.sqlite [--out prefill_load.png]
-       [--range K]    K-th (0-based) "prefill" NVTX range, default: last
-       [--metric NAME]  GPU metric to plot, default "SM Active"
+       [--range K]      K-th (0-based) "prefill" NVTX range, default: last
+       [--metric NAME]  GPU metric; default: first available of a candidate
+                        list (full list printed when nothing matches)
+       [--kernels]      add the kernel-activity panel
 """
 
 from __future__ import annotations
@@ -183,7 +184,7 @@ def short_kernel_name(name: str, limit: int = 40) -> str:
 
 
 def busy_fraction_series(kernels, t0: int, t1: int, buckets: int = BUSY_BUCKETS):
-    """[(bucket_center_frac, busy_pct)] — fraction of wall time covered by at
+    """[(bucket_center_ns, busy_pct)] — fraction of wall time covered by at
     least one kernel, per bucket. Overlaps (concurrent streams) cap at 100%
     because only coverage matters."""
     width = max((t1 - t0) / buckets, 1)
@@ -198,10 +199,52 @@ def busy_fraction_series(kernels, t0: int, t1: int, buckets: int = BUSY_BUCKETS)
             hi = min(ke, t0 + int((i + 1) * width))
             if hi > lo:
                 covered[i] += hi - lo
-    out = []
-    for i, c in enumerate(covered):
-        out.append(((i + 0.5) * width, min(c / width, 1.0) * 100.0))
-    return out
+    return [((i + 0.5) * width, min(c / width, 1.0) * 100.0)
+            for i, c in enumerate(covered)]
+
+
+def draw_kernel_panel(ax, kernels, t0: int, t1: int, dur: float,
+                      force_gantt: bool):
+    if not force_gantt and len(kernels) > GANTT_MAX_LAUNCHES:
+        series = busy_fraction_series(kernels, t0, t1)
+        xs = [(t0 + x) / NS_PER_MS for x, _ in series]
+        ys = [y for _, y in series]
+        ax.fill_between(xs, ys, step="mid", color="#2563eb", alpha=0.7)
+        ax.set_ylim(0, 105)
+        ax.set_ylabel("kernel busy (%)")
+        kmean = sum(ys) / len(ys)
+        ax.axhline(kmean, ls="--", lw=0.8, color="gray")
+        ax.text(dur, kmean + 2, f"mean {kmean:.0f}%", ha="right", fontsize=8,
+                color="gray")
+        ax.text(0.01, 0.97,
+                f"{len(kernels)} launches — too many for a gantt; showing "
+                f"bucketed busy% (--gantt to force)",
+                transform=ax.transAxes, fontsize=8, va="top", color="gray")
+        return
+
+    # Collapse to truncated names first so identical kernels share a color.
+    counts: dict[str, int] = {}
+    for k in kernels:
+        counts[short_kernel_name(k[2] or "?")] = (
+            counts.get(short_kernel_name(k[2] or "?"), 0) + 1
+        )
+    palette = plt.cm.tab20.colors
+    top_names = [n for n, _ in sorted(counts.items(), key=lambda x: -x[1])[:19]]
+    color = {n: palette[i % 20] for i, n in enumerate(top_names)}
+    for i, (ks, ke, name) in enumerate(kernels):
+        c = color.get(short_kernel_name(name or "?"), "#94a3b8")
+        ax.broken_barh(
+            [((ks - t0) / NS_PER_MS,
+              max((ke - ks) / NS_PER_MS, dur * 2e-4))], (i, 1),
+            facecolors=c,
+        )
+    ax.set_ylabel("kernel launch #")
+    ax.set_ylim(0, max(len(kernels), 1))
+    handles = [Line2D([0], [0], color=color[n], lw=6, label=f"{n} ×{counts[n]}")
+               for n in top_names]
+    if len(counts) > len(top_names):
+        handles.append(Line2D([0], [0], color="#94a3b8", lw=6, label="other"))
+    ax.legend(handles=handles, fontsize=7, ncol=2, loc="lower right")
 
 
 def main() -> int:
@@ -214,8 +257,11 @@ def main() -> int:
     ap.add_argument("--range", type=int, default=-1,
                     help="0-based index of the 'prefill' NVTX range to plot "
                          "(default: the last one)")
+    ap.add_argument("--kernels", action="store_true",
+                    help="add the kernel-activity panel (default: metric "
+                         "curve only)")
     ap.add_argument("--gantt", action="store_true",
-                    help="force the per-launch gantt even with many launches")
+                    help="force the per-launch gantt in the kernel panel")
     args = ap.parse_args()
 
     con = sqlite3.connect(args.sqlite)
@@ -242,14 +288,15 @@ def main() -> int:
         print(f"using metric: {metric}", file=sys.stderr)
 
     busy = sm_busy_series(con, metric, (t0, t1) if t0 is not None else None)
-    kernels = kernel_intervals(con)
+    kernels = kernel_intervals(con) if args.kernels else []
     if t0 is None:
         pts = [t for t, _ in (busy or [])] + [k[0] for k in kernels]
         if not pts:
             print("nothing to plot", file=sys.stderr)
             return 1
         t0, t1 = min(pts), max(pts)
-    kernels = [k for k in kernels if k[0] >= t0 and k[1] <= t1]
+    if args.kernels:
+        kernels = [k for k in kernels if k[0] >= t0 and k[1] <= t1]
     if not kernels and not busy:
         print("nothing to plot inside the selected range", file=sys.stderr)
         return 1
@@ -257,10 +304,14 @@ def main() -> int:
     rel_ms = lambda t: (t - t0) / NS_PER_MS
     dur = rel_ms(t1)
 
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(16, 7), sharex=True,
-        gridspec_kw={"height_ratios": [1, 2], "hspace": 0.08},
-    )
+    if args.kernels:
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(16, 7), sharex=True,
+            gridspec_kw={"height_ratios": [1, 2], "hspace": 0.08},
+        )
+    else:
+        fig, ax1 = plt.subplots(figsize=(16, 4))
+        ax2 = None
 
     if busy:
         ts, vs = zip(*busy)
@@ -271,50 +322,14 @@ def main() -> int:
         ax1.axhline(mean, ls="--", lw=0.8, color="gray")
         ax1.text(dur, mean + 2, f"mean {mean:.0f}%", ha="right", fontsize=8,
                  color="gray")
-    ax1.set_title(f"Prefill SM load ({dur:.1f} ms, {len(kernels)} kernel "
-                  f"launches in range {args.range})")
+    n_k = f", {len(kernels)} kernel launches" if args.kernels else ""
+    ax1.set_title(f"Prefill SM load ({dur:.1f} ms, range {args.range}{n_k})")
 
-    use_gantt = args.gantt or len(kernels) <= GANTT_MAX_LAUNCHES
-    if use_gantt:
-        # Collapse to truncated names first so identical kernels share a color.
-        counts: dict[str, int] = {}
-        for k in kernels:
-            counts[short_kernel_name(k[2] or "?")] = (
-                counts.get(short_kernel_name(k[2] or "?"), 0) + 1
-            )
-        palette = plt.cm.tab20.colors
-        top_names = [n for n, _ in sorted(counts.items(), key=lambda x: -x[1])[:19]]
-        color = {n: palette[i % 20] for i, n in enumerate(top_names)}
-        for i, (ks, ke, name) in enumerate(kernels):
-            c = color.get(short_kernel_name(name or "?"), "#94a3b8")
-            ax2.broken_barh(
-                [(rel_ms(ks), max((ke - ks) / NS_PER_MS, dur * 2e-4))], (i, 1),
-                facecolors=c,
-            )
-        ax2.set_ylabel("kernel launch #")
-        ax2.set_ylim(0, max(len(kernels), 1))
-        handles = [Line2D([0], [0], color=color[n], lw=6, label=f"{n} ×{counts[n]}")
-                   for n in top_names]
-        if len(counts) > len(top_names):
-            handles.append(Line2D([0], [0], color="#94a3b8", lw=6,
-                                  label="other"))
-        ax2.legend(handles=handles, fontsize=7, ncol=2, loc="lower right")
+    if ax2 is not None:
+        draw_kernel_panel(ax2, kernels, t0, t1, dur, args.gantt)
+        ax2.set_xlabel("time (ms)")
     else:
-        series = busy_fraction_series(kernels, t0, t1)
-        xs = [rel_ms(t0 + x) for x, _ in series]
-        ys = [y for _, y in series]
-        ax2.fill_between(xs, ys, step="mid", color="#2563eb", alpha=0.7)
-        ax2.set_ylim(0, 105)
-        ax2.set_ylabel("kernel busy (%)")
-        kmean = sum(ys) / len(ys)
-        ax2.axhline(kmean, ls="--", lw=0.8, color="gray")
-        ax2.text(dur, kmean + 2, f"mean {kmean:.0f}%", ha="right", fontsize=8,
-                 color="gray")
-        ax2.text(0.01, 0.97,
-                 f"{len(kernels)} launches — too many for a gantt; showing "
-                 f"bucketed busy% (--gantt to force)",
-                 transform=ax2.transAxes, fontsize=8, va="top", color="gray")
-    ax2.set_xlabel("time (ms)")
+        ax1.set_xlabel("time (ms)")
 
     fig.savefig(args.out, dpi=200, bbox_inches="tight")
     print(f"wrote {args.out}")
