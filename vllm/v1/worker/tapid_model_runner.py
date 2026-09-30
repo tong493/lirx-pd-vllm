@@ -242,6 +242,9 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # own cadence — one token is reported per engine step.
         self._tapid_slot_free: list[int] = []
         self._tapid_req_slot: dict[Any, int] = {}
+        # Paged KV: last page count mirrored per slot (rows are append-only
+        # within a generation, so an unchanged count means an unchanged row).
+        self._tapid_slot_page_count: dict[int, int] = {}
         self._tapid_pending: dict[int, list[int]] = {}
         self._tapid_awaiting_first: set[int] = set()
         # Slots whose device loop reached EOS/budget: the daemon stopped
@@ -963,12 +966,50 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 [s for s in step_slots if s is not None],
                 rows,
             )
+        self._tapid_fill_pages()
         # execute_model asserts a Tensor return; nothing torch-side reads it.
         return torch.zeros(
             (input_ids.shape[0], self._tapid_hidden_size),
             dtype=self.model_config.dtype,
             device=self.device,
         )
+
+    def _tapid_fill_pages(self) -> None:
+        """Mirror vLLM's block allocation into the device's page table.
+
+        The paged-KV device contract (gpu_daemon kv_cache_types.cuh) keeps
+        the page table TAPID-owned; this filler feeds it the full-attention
+        group's block ids each step so the engine owns the allocation
+        decisions (the same ids, at the same 16-token granularity — the
+        arm-time check below pins that). Rows are append-only within a
+        generation, so a slot whose page count did not grow is skipped.
+        """
+        session = self.tapid_session
+        if not hasattr(session, "kv_set_pages"):
+            return  # shim predates the filler seam: built-in allocator rules
+        input_batch = self._tapid_input_batch
+        block_tables = getattr(input_batch, "block_table", None)
+        if input_batch is None or block_tables is None:
+            return
+        fa_bt = block_tables[0]  # group 0 is the full-attention cache group
+        if fa_bt.kv_cache_block_size != 16:
+            raise RuntimeError(
+                f"TAPID paged KV pins KV_PAGE_SIZE=16 but the FA cache "
+                f"group runs block_size={fa_bt.kv_cache_block_size}"
+            )
+        for req_id, slot in self._tapid_req_slot.items():
+            row = input_batch.req_id_to_index.get(req_id)
+            if row is None:
+                continue
+            n = int(fa_bt.num_blocks_per_row[row])
+            if n == 0 or self._tapid_slot_page_count.get(slot) == n:
+                continue
+            session.kv_set_pages(slot, fa_bt.block_table.np[row, :n].tolist())
+            self._tapid_slot_page_count[slot] = n
+            logger.debug(
+                "TAPID decode: slot %d page row -> %d block(s) (req %s)",
+                slot, n, req_id,
+            )
 
     def _tapid_acquire_slot(self) -> int:
         if not self._tapid_slot_free:
@@ -986,6 +1027,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         )
         self.tapid_session.kv_release(slot)
         self._tapid_req_slot.pop(req_id, None)
+        self._tapid_slot_page_count.pop(slot, None)
         self._tapid_awaiting_first.discard(slot)
         self._tapid_done_slots.discard(slot)
         self._tapid_pending.pop(slot, None)
