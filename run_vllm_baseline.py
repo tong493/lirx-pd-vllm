@@ -1,4 +1,8 @@
-"""Plain-vLLM prefill baseline (no TAPID): bf16 weights.
+"""Plain-vLLM baseline (no TAPID): bf16 weights.
+
+--max-tokens 1 (default) times prefill only; any larger value times the full
+generate (prefill + decode), with the ttft/decode split printed on a TIMING
+line identical to run_tapid_vllm.py's.
 
 The comparison point for the TAPID door (run_tapid_vllm.py). NVIDIA_TF32_OVERRIDE=0
 and the torch.backends toggles are inert for a bf16 run — TF32 only ever
@@ -24,6 +28,24 @@ import sys
 import time
 
 os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")  # before any CUDA init
+
+
+def print_timing(out) -> None:
+    """Same TIMING line format as run_tapid_vllm.py, so baseline vs TAPID
+    numbers are directly comparable."""
+    m = out.metrics
+    n = len(out.outputs[0].token_ids)
+    if m is None:
+        print("TIMING: (unavailable — log_stats disabled)")
+        return
+    queue = m.scheduled_ts - m.queued_ts
+    prefill = m.first_token_ts - m.scheduled_ts
+    decode = m.last_token_ts - m.first_token_ts
+    infer = m.last_token_ts - m.scheduled_ts
+    rate = (n - 1) / decode if n > 1 and decode > 0 else float("nan")
+    print(f"TIMING: tokens={n} queue={queue * 1e3:.1f}ms "
+          f"ttft={prefill * 1e3:.1f}ms decode={decode * 1e3:.1f}ms "
+          f"infer={infer * 1e3:.1f}ms ({rate:.1f} tok/s)")
 
 
 def main() -> int:
@@ -89,6 +111,10 @@ def main() -> int:
         # repeated prompt skip recompute and fake the prefill time.
         enable_prefix_caching=False,
         limit_mm_per_prompt={"image": 0, "video": 0},
+        # The offline LLM entrypoint defaults disable_log_stats=True
+        # (vllm/entrypoints/llm.py), which leaves RequestOutput.metrics as
+        # None; the TIMING lines below need RequestStateStats.
+        disable_log_stats=False,
     )
 
     if args.bench_tokens:
@@ -105,16 +131,19 @@ def main() -> int:
             for rep in range(args.bench_reps):
                 prompt = TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
                 t0 = time.perf_counter()
-                # "prefill" NVTX range for nsys/plot_prefill_load.py
-                # (host-side marker only, no GPU-side effect)
-                torch.cuda.nvtx.range_push("prefill")
-                llm.generate([prompt], sampling)
+                # NVTX range for nsys/plot_prefill_load.py (host-side marker
+                # only, no GPU-side effect). "prefill" is only the honest name
+                # when max_tokens==1; longer generations are prefill+decode.
+                name = "prefill" if args.max_tokens <= 1 else "generate"
+                torch.cuda.nvtx.range_push(name)
+                out = llm.generate([prompt], sampling)
                 torch.cuda.nvtx.range_pop()
                 wall = time.perf_counter() - t0
                 print(
                     f"BASELINE bench length={n} rep={rep}: wall={wall:.3f}s "
                     f"({n / wall:.0f} tok/s incl. overhead)"
                 )
+                print_timing(out[0])
         return 0
 
     prompts = args.prompt or ["The capital of France is"]
@@ -130,6 +159,7 @@ def main() -> int:
             f"BASELINE prefill: tokens={tokens} wall={seconds:.4f}s "
             f"({tokens / seconds:.0f} tok/s)"
         )
+        print_timing(out[0])
     return 0
 
 
