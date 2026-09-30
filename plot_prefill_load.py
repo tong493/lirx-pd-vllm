@@ -262,6 +262,12 @@ def main() -> int:
                          "curve only)")
     ap.add_argument("--gantt", action="store_true",
                     help="force the per-launch gantt in the kernel panel")
+    ap.add_argument("--bench-tokens", default=None,
+                    help="comma list passed to run_vllm_baseline.py; with "
+                         "--bench-reps, titles read '<len>tok rep<r>' "
+                         "instead of 'range K' (range order is length-major, "
+                         "rep-minor)")
+    ap.add_argument("--bench-reps", type=int, default=None)
     args = ap.parse_args()
 
     con = sqlite3.connect(args.sqlite)
@@ -276,6 +282,13 @@ def main() -> int:
         print("no NVTX 'prefill' range found - plotting whole timeline",
               file=sys.stderr)
         t0 = t1 = None
+
+    label = f"range {args.range}"
+    if ranges and args.bench_tokens and args.bench_reps:
+        lens = [int(x) for x in args.bench_tokens.split(",") if x.strip()]
+        li, rep = divmod(args.range % len(ranges), args.bench_reps)
+        if li < len(lens):
+            label = f"{lens[li]}tok rep{rep}"
 
     metric = args.metric
     if metric is None:
@@ -315,7 +328,8 @@ def main() -> int:
 
     if busy:
         ts, vs = zip(*busy)
-        ax1.plot([rel_ms(t) for t in ts], vs, lw=0.8, color="#2563eb")
+        ax1.fill_between([rel_ms(t) for t in ts], vs, color="#2563eb",
+                         alpha=0.65, lw=0)
         ax1.set_ylim(0, 105)
         ax1.set_ylabel(f"{metric} (%)")
         mean = sum(v for _, v in busy) / len(busy)
@@ -323,7 +337,7 @@ def main() -> int:
         ax1.text(dur, mean + 2, f"mean {mean:.0f}%", ha="right", fontsize=8,
                  color="gray")
     n_k = f", {len(kernels)} kernel launches" if args.kernels else ""
-    ax1.set_title(f"Prefill SM load ({dur:.1f} ms, range {args.range}{n_k})")
+    ax1.set_title(f"Prefill SM load — {label} ({dur:.1f} ms{n_k})")
 
     if ax2 is not None:
         draw_kernel_panel(ax2, kernels, t0, t1, dur, args.gantt)
