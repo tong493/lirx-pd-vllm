@@ -60,8 +60,13 @@ def nvtx_prefill_span(con: sqlite3.Connection, text: str = "prefill"):
     return min(r[0] for r in rows), max(r[1] for r in rows)
 
 
-def sm_busy_series(con: sqlite3.Connection, metric: str):
-    """[(t_ns, value)] for the requested GPU metric (long-format table)."""
+def sm_busy_series(con: sqlite3.Connection, metric: str, span=None):
+    """[(t_ns, value)] for one GPU metric.
+
+    GPU_METRICS is long-format (every sampled timestamp x every metric, 10^7+
+    rows on a real profile), so the metric filter MUST happen inside SQL —
+    joining/summing all metrics in Python would run for tens of minutes.
+    """
     mcols = columns(con, "GPU_METRICS")
     ccols = columns(con, "GPU_METRICS_CONFIG")
     if not mcols or not ccols:
@@ -73,33 +78,48 @@ def sm_busy_series(con: sqlite3.Connection, metric: str):
     name_col = find_col(ccols, r"name")
     if not all([mid_col, ts_col, val_col, cid_col, name_col]):
         return None
-    rows = con.execute(
-        f"SELECT c.{name_col}, m.{ts_col}, m.{val_col} "
-        f"FROM GPU_METRICS m JOIN GPU_METRICS_CONFIG c ON m.{mid_col} = c.{cid_col}"
-    ).fetchall()
-    if not rows:
-        return None
-    names = {r[0] for r in rows}
+    names = [
+        r[0]
+        for r in con.execute(
+            f"SELECT DISTINCT {name_col} FROM GPU_METRICS_CONFIG WHERE "
+            f"{name_col} IS NOT NULL"
+        )
+    ]
     if metric not in names:
         print(f"available GPU metrics: {sorted(names)}", file=sys.stderr)
         return None
+    where = (f"WHERE m.{mid_col} IN "
+             f"(SELECT {cid_col} FROM GPU_METRICS_CONFIG WHERE {name_col} = ?)")
+    params: list = [metric]
+    if span is not None:
+        where += f" AND m.{ts_col} BETWEEN ? AND ?"
+        params += [span[0], span[1]]
+    rows = con.execute(
+        f"SELECT m.{ts_col}, m.{val_col} FROM GPU_METRICS m {where} "
+        f"ORDER BY m.{ts_col}",
+        params,
+    ).fetchall()
+    # Same-timestamp rows across devices are averaged.
     series: dict[int, float] = {}
-    for name, t, v in rows:
-        if name != metric:
-            continue
-        series[t] = series.get(t, 0.0) + float(v)  # same-timestamp dupes -> avg below
-    if not series:
-        return None
-    # if values were summed over duplicates, normalize to a mean
     counts: dict[int, int] = {}
-    for name, t, v in rows:
-        if name == metric:
-            counts[t] = counts.get(t, 0) + 1
+    for t, v in rows:
+        series[t] = series.get(t, 0.0) + float(v)
+        counts[t] = counts.get(t, 0) + 1
     return [(t, series[t] / counts[t]) for t in sorted(series)]
 
 
 def kernel_intervals(con: sqlite3.Connection):
     cols = columns(con, "CUPTI_ACTIVITY_KIND_KERNEL")
+    if not cols:
+        print(
+            "no CUPTI_ACTIVITY_KIND_KERNEL table — zero kernel records were "
+            "captured. When profiling vLLM v1, all kernels run in the "
+            "EngineCore child process; retry with "
+            "VLLM_ENABLE_V1_MULTIPROCESSING=0 so the engine runs inside the "
+            "profiled process.",
+            file=sys.stderr,
+        )
+        return []
     name_ref = find_col(cols, r"shortName|demangledName")
     rows = con.execute(
         f"SELECT k.start, k.end, s.value FROM CUPTI_ACTIVITY_KIND_KERNEL k "
@@ -118,17 +138,18 @@ def main() -> int:
 
     con = sqlite3.connect(args.sqlite)
     span = nvtx_prefill_span(con)
-    busy = sm_busy_series(con, args.metric)
+    busy = sm_busy_series(con, args.metric, span)
     kernels = kernel_intervals(con)
     if span is not None:
         t0, t1 = span
         kernels = [k for k in kernels if k[0] >= t0 and k[1] <= t1]
-        if busy:
-            busy = [(t, v) for t, v in busy if t0 <= t <= t1]
     else:
         print("no NVTX 'prefill' range found - plotting whole timeline",
               file=sys.stderr)
         pts = [t for t, _ in busy] + [k[0] for k in kernels]
+        if not pts:
+            print("nothing to plot", file=sys.stderr)
+            return 1
         t0, t1 = min(pts), max(pts)
 
     if not kernels and not busy:
