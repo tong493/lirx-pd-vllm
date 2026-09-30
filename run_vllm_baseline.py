@@ -1,8 +1,8 @@
 """Plain-vLLM baseline (no TAPID): bf16 weights.
 
---max-tokens 1 (default) times prefill only; any larger value times the full
-generate (prefill + decode), with the ttft/decode split printed on a TIMING
-line identical to run_tapid_vllm.py's.
+--max-tokens accepts a comma list (e.g. 15,20,30): 1 times prefill only;
+larger values time the full generate (prefill + decode), with the
+ttft/decode split printed on a TIMING line identical to run_tapid_vllm.py's.
 
 The comparison point for the TAPID door (run_tapid_vllm.py). NVIDIA_TF32_OVERRIDE=0
 and the torch.backends toggles are inert for a bf16 run — TF32 only ever
@@ -59,7 +59,14 @@ def main() -> int:
         "generate call, matching the TAPID door's one-prefill-per-step.",
     )
     parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--max-tokens",
+        default="1",
+        help="Comma-separated generation budgets (e.g. 15,20,30): each "
+        "value is one generate per prompt / bench length, so a single "
+        "launch sweeps several generation lengths. 1 (default) = prefill "
+        "only.",
+    )
     parser.add_argument(
         "--bench-tokens",
         default=None,
@@ -122,44 +129,56 @@ def main() -> int:
             from vllm.inputs import TokensPrompt
         except ImportError:
             from vllm import TokensPrompt
-        sampling = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+        max_tokens_list = [int(x) for x in str(args.max_tokens).split(",")
+                           if x.strip()]
         # Same filler ids and timing shape as run_tapid_vllm.py's serial
         # bench: one exact-length TokensPrompt per generate call, so the two
         # measurements differ only in the engine behind the door.
         for raw in args.bench_tokens.split(","):
             n = int(raw.strip())
-            for rep in range(args.bench_reps):
-                prompt = TokensPrompt(prompt_token_ids=[2000 + (n % 100)] * n)
-                t0 = time.perf_counter()
-                # NVTX range for nsys/plot_prefill_load.py (host-side marker
-                # only, no GPU-side effect). "prefill" is only the honest name
-                # when max_tokens==1; longer generations are prefill+decode.
-                name = "prefill" if args.max_tokens <= 1 else "generate"
-                torch.cuda.nvtx.range_push(name)
-                out = llm.generate([prompt], sampling)
-                torch.cuda.nvtx.range_pop()
-                wall = time.perf_counter() - t0
-                print(
-                    f"BASELINE bench length={n} rep={rep}: wall={wall:.3f}s "
-                    f"({n / wall:.0f} tok/s incl. overhead)"
-                )
-                print_timing(out[0])
+            for mt in max_tokens_list:
+                sampling = SamplingParams(temperature=0.0, max_tokens=mt)
+                for rep in range(args.bench_reps):
+                    prompt = TokensPrompt(
+                        prompt_token_ids=[2000 + (n % 100)] * n)
+                    t0 = time.perf_counter()
+                    # NVTX range for nsys/plot_prefill_load.py (host-side
+                    # marker only, no GPU-side effect). "prefill" is only the
+                    # honest name when max_tokens==1; longer generations are
+                    # prefill+decode.
+                    name = "prefill" if mt <= 1 else "generate"
+                    torch.cuda.nvtx.range_push(name)
+                    out = llm.generate([prompt], sampling)
+                    torch.cuda.nvtx.range_pop()
+                    wall = time.perf_counter() - t0
+                    print(
+                        f"BASELINE bench length={n} max_tokens={mt} "
+                        f"rep={rep}: wall={wall:.3f}s "
+                        f"({n / wall:.0f} tok/s incl. overhead)"
+                    )
+                    print_timing(out[0])
         return 0
 
+    max_tokens_list = [int(x) for x in str(args.max_tokens).split(",")
+                       if x.strip()]
     prompts = args.prompt or ["The capital of France is"]
     for prompt in prompts:
-        started = time.monotonic()
-        out = llm.generate(
-            [prompt],
-            SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
-        )
-        seconds = time.monotonic() - started
-        tokens = len(out[0].prompt_token_ids)
-        print(
-            f"BASELINE prefill: tokens={tokens} wall={seconds:.4f}s "
-            f"({tokens / seconds:.0f} tok/s)"
-        )
-        print_timing(out[0])
+        for mt in max_tokens_list:
+            started = time.monotonic()
+            out = llm.generate(
+                [prompt],
+                SamplingParams(temperature=0.0, max_tokens=mt),
+            )
+            seconds = time.monotonic() - started
+            tokens = len(out[0].prompt_token_ids)
+            gen = len(out[0].outputs[0].token_ids)
+            print(
+                f"BASELINE generate: prompt_tokens={tokens} "
+                f"max_tokens={mt} (generated {gen}) wall={seconds:.4f}s "
+                f"({gen / seconds:.1f} gen tok/s incl. overhead)"
+            )
+            print_timing(out[0])
+            print(f"  text: {out[0].outputs[0].text!r}")
     return 0
 
 
