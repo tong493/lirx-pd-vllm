@@ -497,8 +497,14 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # before the program is swapped in.
         time.sleep(0.3)
         logger.info("TAPID: launch returned in %.2fs", time.monotonic() - started)
+        # Review 1.3: the decode program's ENTRY stage is the model's Embed
+        # SOP — prefill submissions become [T, 1] token ids (no host-side
+        # gather, no [T, hidden] upload). The prefill-measurement program
+        # keeps the host-side embedding: its inputs_embeds path has no token
+        # ids to feed.
         payload = self.tapid_adapter.decoder_program_payload(
-            self.tapid_session.abi, output_head=self.tapid_decode
+            self.tapid_session.abi, output_head=self.tapid_decode,
+            embed_entry=self.tapid_decode,
         )
         self.tapid_session.set_program(
             payload, timeout_ms=_TAPID_PROGRAM_TIMEOUT_MS
@@ -902,27 +908,27 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         the prefill's qk_norm_rope commits K/V into the slot's regions at the
         sidecar positions) and submit the embedded hidden rows under
         request_id == slot; the program's head stage lands the first sampled
-        token in the slot's terminal mailbox. Decode rows (an already-armed
-        request's 1-row step) are NEVER submitted: the device-side decode
-        loop is already producing that request's tokens autonomously; this
-        row exists only so vLLM's scheduler bookkeeping advances. The return
-        value is a dummy tensor — _decode_sample_tokens below replaces the
-        sampler entirely.
+        token in the slot's terminal mailbox. Prefills submit [T, 1] token ids
+        (review 1.3: the program's entry Embed SOP gathers the vocabulary rows
+        on-device). Decode rows (an already-armed request's 1-row step) are
+        NEVER submitted: the device-side decode loop is already producing that
+        request's tokens autonomously; this row exists only so vLLM's scheduler
+        bookkeeping advances. The return value is a dummy tensor —
+        _decode_sample_tokens below replaces the sampler entirely.
         """
         rows, num_reqs, bounds, computed_list = self._prefill_batch()
         if inputs_embeds is not None:
-            hidden = inputs_embeds
-        elif input_ids is not None:
-            hidden = self.model.embed_input_ids(input_ids)
-        else:
             raise RuntimeError(
-                "TAPID decode forward requires token ids or input embeddings"
+                "TAPID decode mode feeds token ids to the program's entry "
+                "Embed SOP; inputs_embeds carries no token ids to gather with"
             )
-        if hidden.shape[0] < rows or hidden.shape[1] != self._tapid_hidden_size:
+        if input_ids is None:
+            raise RuntimeError("TAPID decode forward requires token ids")
+        if input_ids.shape[0] < rows:
             raise RuntimeError(
-                f"embedded hidden {tuple(hidden.shape)} cannot carry {rows} "
-                f"rows of width {self._tapid_hidden_size}"
+                f"token ids {tuple(input_ids.shape)} cannot carry {rows} rows"
             )
+        from tapid.bench.abi import DTYPE_F32
 
         step_slots: list[int | None] = []
         n_prefills = 0
@@ -953,8 +959,11 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             # own max_tokens (or eos) earlier and the slot is released then.
             budget = max(1, self._tapid_max_len - prompt_len)
             self.tapid_session.kv_alloc(slot, prompt_len, budget)
-            self.tapid_session.submit_hidden(
-                slot, hidden[start:end], self._tapid_hidden_size
+            # Review 1.3: [T, 1] F32 token ids — the entry Embed SOP does the
+            # vocabulary gather on-device.
+            self.tapid_session.submit(
+                slot, input_ids[start:end].tolist(), prompt_len, 1,
+                dtype=DTYPE_F32,
             )
             step_slots.append(slot)
             n_prefills += 1
