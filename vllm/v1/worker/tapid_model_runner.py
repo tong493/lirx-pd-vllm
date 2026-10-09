@@ -250,6 +250,10 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # samples) from generated tokens (pos >= prompt_len - 1), the same
         # classification decode_smoke's drain makes over the sidecar mirrors.
         self._tapid_prompt_len: dict[int, int] = {}
+        # Full-attention cache group index (the one whose kernel block size
+        # is KV_PAGE_SIZE=16), resolved once against the V2 runner's
+        # BlockTables; None until first needed, -1 = no matching group.
+        self._tapid_fa_group: int | None = None
         self._tapid_pending: dict[int, list[int]] = {}
         self._tapid_awaiting_first: set[int] = set()
         # Slots whose device loop reached EOS/budget: the daemon stopped
@@ -998,42 +1002,61 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             device=self.device,
         )
 
+    def _tapid_fa_block_table(self) -> tuple[Any, int] | None:
+        """The full-attention group's V2 block table and its group index.
+
+        V2 (#175) keeps block tables on the runner — gpu/block_table.py's
+        BlockTables, one StagedWriteTensor row per group — not on the
+        InputBatch: the earlier input_batch.block_table read found nothing,
+        so no page row was ever published in any run and every FA K/V write
+        was dropped against a cap=0 region. There is no CPU mirror for the
+        id rows; apply_staged_writes() runs in execute_model before the
+        forward (model_runner.py:1418), so the GPU rows are current whenever
+        a publish fires (submit path or _tapid_fill_pages, both inside the
+        forward). The kernel block size is what the stored ids are at — the
+        device page contract needs exactly 16-token pages.
+        """
+        if self._tapid_fa_group is None:
+            self._tapid_fa_group = -1
+            for i, kbs in enumerate(self.block_tables.kernel_block_sizes):
+                if kbs == 16:
+                    self._tapid_fa_group = i
+                    break
+        g = self._tapid_fa_group
+        if g < 0:
+            return None
+        return self.block_tables.block_tables[g], g
+
     def _tapid_publish_pages(self, req_id: Any, slot: int) -> bool:
         """Mirror vLLM's current FA block row for one request into the device.
 
         The paged-KV device contract (gpu_daemon kv_cache_types.cuh) keeps
         the page table TAPID-owned; this filler feeds it the full-attention
         group's block ids so the engine owns the allocation decisions (the
-        same ids, at the same 16-token granularity — the arm-time check
-        below pins that). Rows are append-only within a generation, so a
-        slot whose page count did not grow is skipped. Returns True when a
-        fresh row was published.
+        same ids, at the same 16-token granularity — the group check below
+        pins that). Rows are append-only within a generation, so a slot
+        whose page count did not grow is skipped. Returns True when a fresh
+        row was published.
         """
         session = self.tapid_session
         if not hasattr(session, "kv_set_pages"):
             return False  # shim predates the filler seam: built-in allocator rules
-        input_batch = self._tapid_input_batch
-        block_tables = getattr(input_batch, "block_table", None)
-        if input_batch is None or block_tables is None:
+        fa = self._tapid_fa_block_table()
+        if fa is None:
             logger.warning(
-                "TAPID decode: no InputBatch/block table to publish from "
-                "(req %s) — page row withheld", req_id,
+                "TAPID decode: no full-attention cache group with kernel "
+                "block size 16 — page row withheld (req %s)", req_id,
             )
             return False
-        fa_bt = block_tables[0]  # group 0 is the full-attention cache group
-        if fa_bt.kv_cache_block_size != 16:
-            raise RuntimeError(
-                f"TAPID paged KV pins KV_PAGE_SIZE=16 but the FA cache "
-                f"group runs block_size={fa_bt.kv_cache_block_size}"
-            )
-        row = input_batch.req_id_to_index.get(req_id)
+        fa_bt, group = fa
+        row = self.req_states.req_id_to_index.get(req_id)
         if row is None:
             logger.warning(
-                "TAPID decode: req %s not in the InputBatch — page row "
+                "TAPID decode: req %s not in the request states — page row "
                 "withheld", req_id,
             )
             return False
-        n = int(fa_bt.num_blocks_per_row[row])
+        n = int(self.block_tables.num_blocks.np[group, row])
         if n == 0:
             logger.warning(
                 "TAPID decode: req %s block row reads empty at publish — "
@@ -1043,7 +1066,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             return False
         if self._tapid_slot_page_count.get(slot) == n:
             return False
-        ids = fa_bt.block_table.np[row, :n].tolist()
+        ids = fa_bt.gpu[row, :n].tolist()
         session.kv_set_pages(slot, ids)
         self._tapid_slot_page_count[slot] = n
         logger.info(
