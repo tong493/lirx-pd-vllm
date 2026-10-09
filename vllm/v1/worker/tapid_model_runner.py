@@ -1015,6 +1015,10 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         input_batch = self._tapid_input_batch
         block_tables = getattr(input_batch, "block_table", None)
         if input_batch is None or block_tables is None:
+            logger.warning(
+                "TAPID decode: no InputBatch/block table to publish from "
+                "(req %s) — page row withheld", req_id,
+            )
             return False
         fa_bt = block_tables[0]  # group 0 is the full-attention cache group
         if fa_bt.kv_cache_block_size != 16:
@@ -1024,15 +1028,27 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             )
         row = input_batch.req_id_to_index.get(req_id)
         if row is None:
+            logger.warning(
+                "TAPID decode: req %s not in the InputBatch — page row "
+                "withheld", req_id,
+            )
             return False
         n = int(fa_bt.num_blocks_per_row[row])
-        if n == 0 or self._tapid_slot_page_count.get(slot) == n:
+        if n == 0:
+            logger.warning(
+                "TAPID decode: req %s block row reads empty at publish — "
+                "page row withheld (device back-pressure will hold the "
+                "chain until it lands)", req_id,
+            )
             return False
-        session.kv_set_pages(slot, fa_bt.block_table.np[row, :n].tolist())
+        if self._tapid_slot_page_count.get(slot) == n:
+            return False
+        ids = fa_bt.block_table.np[row, :n].tolist()
+        session.kv_set_pages(slot, ids)
         self._tapid_slot_page_count[slot] = n
-        logger.debug(
-            "TAPID decode: slot %d page row -> %d block(s) (req %s)",
-            slot, n, req_id,
+        logger.info(
+            "TAPID decode: slot %d page row -> %d block(s) ids=%s (req %s)",
+            slot, n, ids, req_id,
         )
         return True
 
