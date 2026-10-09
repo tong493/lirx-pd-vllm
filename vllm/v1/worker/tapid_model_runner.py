@@ -245,6 +245,11 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # Paged KV: last page count mirrored per slot (rows are append-only
         # within a generation, so an unchanged count means an unchanged row).
         self._tapid_slot_page_count: dict[int, int] = {}
+        # Prompt length per armed slot: the mailbox drain needs it to tell
+        # the prefill's per-position argmax rows (pos < prompt_len - 1, not
+        # samples) from generated tokens (pos >= prompt_len - 1), the same
+        # classification decode_smoke's drain makes over the sidecar mirrors.
+        self._tapid_prompt_len: dict[int, int] = {}
         self._tapid_pending: dict[int, list[int]] = {}
         self._tapid_awaiting_first: set[int] = set()
         # Slots whose device loop reached EOS/budget: the daemon stopped
@@ -960,6 +965,15 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             # own max_tokens (or eos) earlier and the slot is released then.
             budget = max(1, self._tapid_max_len - prompt_len)
             self.tapid_session.kv_alloc(slot, prompt_len, budget)
+            self._tapid_prompt_len[slot] = prompt_len
+            # Publish the page row BEFORE the submit. Filler-mode kv_alloc
+            # hands the slot cap=0 region rows, and this request only enters
+            # _tapid_req_slot after the forward returns — the post-loop
+            # _tapid_fill_pages never covers it, so the prefill used to run
+            # against an empty page table: every FA K/V write in that window
+            # hits KvFaTokenPtr's pos >= cap nullptr path and is dropped,
+            # permanently, for the whole generation.
+            self._tapid_publish_pages(req_ids[i], slot)
             # Review 1.3: [T, 1] F32 token ids — the entry Embed SOP does the
             # vocabulary gather on-device.
             self.tapid_session.submit(
@@ -984,42 +998,54 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             device=self.device,
         )
 
-    def _tapid_fill_pages(self) -> None:
-        """Mirror vLLM's block allocation into the device's page table.
+    def _tapid_publish_pages(self, req_id: Any, slot: int) -> bool:
+        """Mirror vLLM's current FA block row for one request into the device.
 
         The paged-KV device contract (gpu_daemon kv_cache_types.cuh) keeps
         the page table TAPID-owned; this filler feeds it the full-attention
-        group's block ids each step so the engine owns the allocation
-        decisions (the same ids, at the same 16-token granularity — the
-        arm-time check below pins that). Rows are append-only within a
-        generation, so a slot whose page count did not grow is skipped.
+        group's block ids so the engine owns the allocation decisions (the
+        same ids, at the same 16-token granularity — the arm-time check
+        below pins that). Rows are append-only within a generation, so a
+        slot whose page count did not grow is skipped. Returns True when a
+        fresh row was published.
         """
         session = self.tapid_session
         if not hasattr(session, "kv_set_pages"):
-            return  # shim predates the filler seam: built-in allocator rules
+            return False  # shim predates the filler seam: built-in allocator rules
         input_batch = self._tapid_input_batch
         block_tables = getattr(input_batch, "block_table", None)
         if input_batch is None or block_tables is None:
-            return
+            return False
         fa_bt = block_tables[0]  # group 0 is the full-attention cache group
         if fa_bt.kv_cache_block_size != 16:
             raise RuntimeError(
                 f"TAPID paged KV pins KV_PAGE_SIZE=16 but the FA cache "
                 f"group runs block_size={fa_bt.kv_cache_block_size}"
             )
+        row = input_batch.req_id_to_index.get(req_id)
+        if row is None:
+            return False
+        n = int(fa_bt.num_blocks_per_row[row])
+        if n == 0 or self._tapid_slot_page_count.get(slot) == n:
+            return False
+        session.kv_set_pages(slot, fa_bt.block_table.np[row, :n].tolist())
+        self._tapid_slot_page_count[slot] = n
+        logger.debug(
+            "TAPID decode: slot %d page row -> %d block(s) (req %s)",
+            slot, n, req_id,
+        )
+        return True
+
+    def _tapid_fill_pages(self) -> None:
+        """Mirror vLLM's block allocation into the device's page table.
+
+        Covers the already-armed requests each step; a fresh prefill's row
+        is published by the submit path itself (_tapid_publish_pages before
+        submit — the device's prefill writes K/V through the page table the
+        moment it executes, and filler-mode kv_alloc publishes cap=0).
+        """
         for req_id, slot in self._tapid_req_slot.items():
-            row = input_batch.req_id_to_index.get(req_id)
-            if row is None:
-                continue
-            n = int(fa_bt.num_blocks_per_row[row])
-            if n == 0 or self._tapid_slot_page_count.get(slot) == n:
-                continue
-            session.kv_set_pages(slot, fa_bt.block_table.np[row, :n].tolist())
-            self._tapid_slot_page_count[slot] = n
-            logger.debug(
-                "TAPID decode: slot %d page row -> %d block(s) (req %s)",
-                slot, n, req_id,
-            )
+            self._tapid_publish_pages(req_id, slot)
 
     def _tapid_acquire_slot(self) -> int:
         if not self._tapid_slot_free:
@@ -1038,6 +1064,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         self.tapid_session.kv_release(slot)
         self._tapid_req_slot.pop(req_id, None)
         self._tapid_slot_page_count.pop(slot, None)
+        self._tapid_prompt_len.pop(slot, None)
         self._tapid_awaiting_first.discard(slot)
         self._tapid_done_slots.discard(slot)
         self._tapid_pending.pop(slot, None)
@@ -1053,7 +1080,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         chunk = _TAPID_FETCH_CHUNK_MS if first else _TAPID_DECODE_CHUNK_MS
         while True:
             try:
-                payload, out_rows, out_cols, _mirrors = (
+                payload, out_rows, out_cols, mirrors = (
                     self.tapid_session.fetch_with_token_ids(
                         slot, n_expect, timeout_ms=chunk
                     )
@@ -1084,13 +1111,26 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 f"TAPID decode: slot {slot} mailbox returned {out_cols} "
                 "columns, expected the head SOP's [T, 2]"
             )
-        # The head SOP's terminal [T, 2] carries one row per position: for a
-        # prefill entry T == prompt rows (argmax at each position), for a
-        # decode entry T == 1. Only the LAST row is the step's sampled token
-        # — the same row the device daemon's done_token reads. Taking row 0
-        # would report the position-0 argmax plus every prompt position's
-        # argmax as "generated" tokens.
-        return [int(payload[(out_rows - 1) * 2 + 1])]
+        # The fetch drains EVERY row queued since the last call, so report
+        # every generated token it carried — keeping only the newest row
+        # silently dropped the rest whenever the device outran the scheduler
+        # (its self-loop does not pace itself against engine steps), which
+        # desynced the reported stream AND the engine's block-allocation
+        # pacing from the device's positions. Row classification mirrors
+        # decode_smoke's drain over the sidecar mirrors: a prefill entry's
+        # rows are per-position argmaxes — pos < prompt_len - 1 are
+        # intermediates (dropped), pos == prompt_len - 1 is the first
+        # generated token; decode entries carry pos >= prompt_len.
+        prompt_len = self._tapid_prompt_len.get(slot)
+        if prompt_len is None:
+            # No arm-time record (defensive): fall back to the newest row.
+            return [int(payload[(out_rows - 1) * 2 + 1])]
+        tokens: list[int] = []
+        for r in range(out_rows):
+            if int(mirrors[r].pos) < prompt_len - 1:
+                continue
+            tokens.append(int(payload[r * 2 + 1]))
+        return tokens
 
     def _tapid_next_token(self, slot: int, *, first: bool) -> int:
         if slot in self._tapid_done_slots:
