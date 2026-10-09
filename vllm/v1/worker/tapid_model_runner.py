@@ -546,6 +546,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             max_slots=max_slots,
             max_len=self._tapid_max_len,
             eos_id=self._tapid_eos_id,
+            filler=True,
         )
         self._tapid_slot_free = list(range(max_slots))
         logger.info(
