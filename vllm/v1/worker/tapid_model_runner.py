@@ -1036,12 +1036,22 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         if prompt_len is None:
             return False  # released mid-step; nothing to cover
         pages = self._tapid_slot_pages.setdefault(slot, [])
-        # The device's feed position never passes prompt_len + reported
-        # tokens (one feed per generated token, and the prefill token's
-        # feed composes at prompt_len), so ceil((prompt_len + generated)/16)
-        # pages always cover the next step with one page to spare at most.
+        # The device's next KV write lands at pos = prompt_len + produced
+        # (one row per fed token; when the runner is caught up, produced ==
+        # reported, and the back-pressure wait covers any temporary lead).
+        # So the row must cover that position itself:
+        # ceil((prompt_len + generated + 1)/16) pages. A plain
+        # ceil((prompt_len + generated)/16) comes up exactly one position
+        # short at every 16-token boundary — the row then covers 0..16k-1
+        # while the next write lands ON 16k, and the chain deadlocks: the
+        # device waits in back-pressure for a row only this runner grows,
+        # and this runner grows it only after reporting the token that
+        # stalled write would have produced (cloud repro 2026-10-10:
+        # prompt=5, generated=11, need=17 cap=16, "still waiting" until the
+        # 120s fetch timeout).
         generated = self._tapid_generated.get(slot, 0)
-        needed = (prompt_len + generated + _TAPID_KV_PAGE_SIZE - 1) // _TAPID_KV_PAGE_SIZE
+        needed = (prompt_len + generated + _TAPID_KV_PAGE_SIZE
+                  ) // _TAPID_KV_PAGE_SIZE
         if len(pages) >= needed:
             return False
         while len(pages) < needed:
