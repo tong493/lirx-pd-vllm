@@ -889,7 +889,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             self.device, dtype=self.model_config.dtype
         )
         torch.cuda.current_stream().synchronize()
-        logger.info("TAPID: post-door H2D drained (rows=%d)", out.shape[0])
+        logger.debug("TAPID: post-door H2D drained (rows=%d)", out.shape[0])
         normed = self._tapid_text_model().norm(out)
         if isinstance(normed, tuple):
             normed = normed[0]
@@ -910,7 +910,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # torch.cuda.synchronize makes engine-level syncs stream-scoped too);
         # a device-wide sync is the thing that must never happen.
         torch.cuda.current_stream().synchronize()
-        logger.info(
+        logger.debug(
             "TAPID: main stream drained after prefill #%d", self._tapid_steps
         )
         return normed
@@ -1062,7 +1062,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 )
             pages.append(self._tapid_page_free.pop())
         session.kv_set_pages(slot, pages)
-        logger.info(
+        logger.debug(
             "TAPID decode: slot %d page row -> %d page(s) (req %s)",
             slot, len(pages), req_id,
         )
@@ -1238,7 +1238,7 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 # _tapid_next_token).
                 self._tapid_done_slots.add(slot)
             self._tapid_generated[slot] = self._tapid_generated.get(slot, 0) + 1
-            logger.info(
+            logger.debug(
                 "TAPID decode: slot %d token #%d = %d%s",
                 slot, self._tapid_generated[slot], token,
                 " (prefill)" if first else "",
