@@ -65,6 +65,12 @@ _TAPID_DUMP_GAP_S = 5.0
 # deadline only exists to convert a wedged device loop into a loud error.
 _TAPID_DECODE_CHUNK_MS = 5_000
 _TAPID_DECODE_TIMEOUT_MS = 120_000
+# The device paged-KV contract (gpu_daemon kv_cache_types.cuh): 16-token
+# pages over TAPID's own pool. vLLM's block ids are unusable as page ids —
+# the hybrid allocator pins the engine block size to the mamba page size
+# (784 for Qwen3.6-27B, GDN's state layout), and the two pools are separate
+# memory regardless — so the runner allocates device pages itself.
+_TAPID_KV_PAGE_SIZE = 16
 
 # Pre-arm the fetch can block far longer than a decode step ever would; a
 # hung prefill surfaces as this timeout, not as a silent wedge.
@@ -242,18 +248,18 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         # own cadence — one token is reported per engine step.
         self._tapid_slot_free: list[int] = []
         self._tapid_req_slot: dict[Any, int] = {}
-        # Paged KV: last page count mirrored per slot (rows are append-only
-        # within a generation, so an unchanged count means an unchanged row).
-        self._tapid_slot_page_count: dict[int, int] = {}
+        # Paged KV: the slot's device page row (append-only within a
+        # generation) and the runner-side free list it allocates from. The
+        # pool is sized slots x max_len / 16 pages (the device config's own
+        # formula), so arming all slots at max_len exactly fits — the fill
+        # cannot exhaust it while max_num_seqs <= slots is enforced.
+        self._tapid_slot_pages: dict[int, list[int]] = {}
+        self._tapid_page_free: list[int] = []
         # Prompt length per armed slot: the mailbox drain needs it to tell
         # the prefill's per-position argmax rows (pos < prompt_len - 1, not
         # samples) from generated tokens (pos >= prompt_len - 1), the same
         # classification decode_smoke's drain makes over the sidecar mirrors.
         self._tapid_prompt_len: dict[int, int] = {}
-        # Full-attention cache group index (the one whose kernel block size
-        # is KV_PAGE_SIZE=16), resolved once against the V2 runner's
-        # BlockTables; None until first needed, -1 = no matching group.
-        self._tapid_fa_group: int | None = None
         self._tapid_pending: dict[int, list[int]] = {}
         self._tapid_awaiting_first: set[int] = set()
         # Slots whose device loop reached EOS/budget: the daemon stopped
@@ -558,6 +564,12 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             filler=True,
         )
         self._tapid_slot_free = list(range(max_slots))
+        # The device page pool is reserved slots x max_len / _TAPID_KV_PAGE_SIZE
+        # pages (the kv_cache configure log's own arithmetic), so the free list
+        # covers every slot running to max_len simultaneously.
+        self._tapid_page_free = list(
+            range(max_slots * self._tapid_max_len // _TAPID_KV_PAGE_SIZE)
+        )
         logger.info(
             "TAPID decode: %d slots armed, max_len=%d, eos_id=%d",
             max_slots, self._tapid_max_len, self._tapid_eos_id,
@@ -1002,81 +1014,52 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             device=self.device,
         )
 
-    def _tapid_fa_block_table(self) -> tuple[Any, int] | None:
-        """The full-attention group's V2 block table and its group index.
-
-        V2 (#175) keeps block tables on the runner — gpu/block_table.py's
-        BlockTables, one StagedWriteTensor row per group — not on the
-        InputBatch: the earlier input_batch.block_table read found nothing,
-        so no page row was ever published in any run and every FA K/V write
-        was dropped against a cap=0 region. There is no CPU mirror for the
-        id rows; apply_staged_writes() runs in execute_model before the
-        forward (model_runner.py:1418), so the GPU rows are current whenever
-        a publish fires (submit path or _tapid_fill_pages, both inside the
-        forward). The kernel block size is what the stored ids are at — the
-        device page contract needs exactly 16-token pages.
-        """
-        if self._tapid_fa_group is None:
-            self._tapid_fa_group = -1
-            for i, kbs in enumerate(self.block_tables.kernel_block_sizes):
-                if kbs == 16:
-                    self._tapid_fa_group = i
-                    break
-        g = self._tapid_fa_group
-        if g < 0:
-            return None
-        return self.block_tables.block_tables[g], g
-
     def _tapid_publish_pages(self, req_id: Any, slot: int) -> bool:
-        """Mirror vLLM's current FA block row for one request into the device.
+        """Grow the slot's device page row to cover the tokens it holds.
 
         The paged-KV device contract (gpu_daemon kv_cache_types.cuh) keeps
-        the page table TAPID-owned; this filler feeds it the full-attention
-        group's block ids so the engine owns the allocation decisions (the
-        same ids, at the same 16-token granularity — the group check below
-        pins that). Rows are append-only within a generation, so a slot
-        whose page count did not grow is skipped. Returns True when a fresh
-        row was published.
+        the page table TAPID-owned: 16-token pages over TAPID's own pool.
+        vLLM's block ids cannot fill that table — the hybrid allocator pins
+        the engine block size to the mamba page size (784 for Qwen3.6-27B,
+        GDN's state layout) while the device page is 16 tokens, and the two
+        pools are separate memory regardless. So the runner allocates device
+        pages itself from its own free list, one per 16-token boundary the
+        generation crosses (kv_alloc published cap=0; the row is append-only
+        within a generation and the device's back-pressure holds the chain
+        until a grown row lands). Pages are freed on slot release. Returns
+        True when the row grew.
         """
         session = self.tapid_session
         if not hasattr(session, "kv_set_pages"):
             return False  # shim predates the filler seam: built-in allocator rules
-        fa = self._tapid_fa_block_table()
-        if fa is None:
-            logger.warning(
-                "TAPID decode: no full-attention cache group with kernel "
-                "block size 16 — page row withheld (req %s)", req_id,
-            )
+        prompt_len = self._tapid_prompt_len.get(slot)
+        if prompt_len is None:
+            return False  # released mid-step; nothing to cover
+        pages = self._tapid_slot_pages.setdefault(slot, [])
+        # The device's feed position never passes prompt_len + reported
+        # tokens (one feed per generated token, and the prefill token's
+        # feed composes at prompt_len), so ceil((prompt_len + generated)/16)
+        # pages always cover the next step with one page to spare at most.
+        generated = self._tapid_generated.get(slot, 0)
+        needed = (prompt_len + generated + _TAPID_KV_PAGE_SIZE - 1) // _TAPID_KV_PAGE_SIZE
+        if len(pages) >= needed:
             return False
-        fa_bt, group = fa
-        row = self.req_states.req_id_to_index.get(req_id)
-        if row is None:
-            logger.warning(
-                "TAPID decode: req %s not in the request states — page row "
-                "withheld", req_id,
-            )
-            return False
-        n = int(self.block_tables.num_blocks.np[group, row])
-        if n == 0:
-            logger.warning(
-                "TAPID decode: req %s block row reads empty at publish — "
-                "page row withheld (device back-pressure will hold the "
-                "chain until it lands)", req_id,
-            )
-            return False
-        if self._tapid_slot_page_count.get(slot) == n:
-            return False
-        ids = fa_bt.gpu[row, :n].tolist()
-        session.kv_set_pages(slot, ids)
-        self._tapid_slot_page_count[slot] = n
+        while len(pages) < needed:
+            if not self._tapid_page_free:
+                raise RuntimeError(
+                    "TAPID decode: device page pool exhausted (slots x "
+                    "max_len / 16 pages); lower --max-num-seqs"
+                )
+            pages.append(self._tapid_page_free.pop())
+        session.kv_set_pages(slot, pages)
         logger.info(
-            "TAPID decode: slot %d page row -> %d block(s) ids=%s (req %s)",
-            slot, n, ids, req_id,
+            "TAPID decode: slot %d page row -> %d page(s) (req %s)",
+            slot, len(pages), req_id,
         )
         return True
 
     def _tapid_fill_pages(self) -> None:
-        """Mirror vLLM's block allocation into the device's page table.
+        """Grow every armed slot's device page row to cover its tokens.
 
         Covers the already-armed requests each step; a fresh prefill's row
         is published by the submit path itself (_tapid_publish_pages before
@@ -1101,8 +1084,8 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             slot, req_id, self._tapid_generated.get(slot, 0),
         )
         self.tapid_session.kv_release(slot)
+        self._tapid_page_free.extend(self._tapid_slot_pages.pop(slot, []))
         self._tapid_req_slot.pop(req_id, None)
-        self._tapid_slot_page_count.pop(slot, None)
         self._tapid_prompt_len.pop(slot, None)
         self._tapid_awaiting_first.discard(slot)
         self._tapid_done_slots.discard(slot)
@@ -1251,6 +1234,10 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
                 " (prefill)" if first else "",
             )
             sampled.append([token])
+
+        # Grow page rows for the tokens just reported so the device's feed
+        # positions never outrun the published cap by more than one step.
+        self._tapid_fill_pages()
 
         for req_id in list(state.finished_req_ids or ()):
             slot = self._tapid_req_slot.get(req_id)
