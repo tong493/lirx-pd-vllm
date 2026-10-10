@@ -39,4 +39,13 @@ export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 # Let the door find its lib without extra env: point it at the checkout build.
 export TAPID_PY_LIB="${TAPID_PY_LIB:-$TAPID_REPO/build/libtapid_py.so}"
 
+# --interactive runs an unbounded REPL: no timeout wrapper. SIGKILL would
+# skip the runner's shutdown chain and leave the TAPID persistent kernel
+# resident on the device with no way to stop it.
+for arg in "$@"; do
+  if [ "$arg" = "--interactive" ]; then
+    exec stdbuf -o0 -e0 "$PYTHON" -u "$VLLM_REPO_DIR/run_tapid_vllm.py" "$@"
+  fi
+done
+
 exec stdbuf -o0 -e0 timeout -s KILL "${TAPID_TIMEOUT:-2400}" "$PYTHON" -u "$VLLM_REPO_DIR/run_tapid_vllm.py" "$@"

@@ -45,6 +45,64 @@ if _TAPID_REPO:
 MODEL = None  # no default: pass --model /path/to/Qwen3.6-27B
 
 
+def _run_interactive(llm, args) -> int:
+    """Read one prompt per line; 'exit' or EOF stops the engine cleanly.
+
+    The output budget is max_model_len minus the prompt's own token count —
+    the same budget the TAPID door hands to kv_alloc, so vLLM's finish
+    condition and the device region limit agree by construction.
+    """
+    from vllm import SamplingParams
+    try:
+        from vllm.inputs import TokensPrompt
+    except ImportError:
+        from vllm import TokensPrompt
+
+    tokenizer = llm.get_tokenizer()
+    print(
+        "==============================================\n"
+        "TAPID 引擎已就绪（持久内核常驻）。\n"
+        "输入提示词开始生成；输入 exit（或 Ctrl-D）退出并关停内核；\n"
+        "空行忽略。每次输出第一行为用时（prefill/decode），随后是生成文本；\n"
+        f"单条最大输出 = max_model_len({args.max_model_len}) − 输入 token 数。\n"
+        "=============================================="
+    )
+    while True:
+        try:
+            line = input("tapid> ").strip()
+        except EOFError:
+            print()
+            break
+        if not line:
+            continue
+        if line.lower() == "exit":
+            break
+        prompt_ids = tokenizer.encode(line)
+        budget = args.max_model_len - len(prompt_ids)
+        if budget <= 0:
+            print(f"prompt too long: {len(prompt_ids)} tokens >= "
+                  f"max_model_len {args.max_model_len}")
+            continue
+        out = llm.generate(
+            [TokensPrompt(prompt_token_ids=prompt_ids)],
+            SamplingParams(temperature=0.0, max_tokens=budget),
+        )[0]
+        n = len(out.outputs[0].token_ids)
+        m = out.metrics
+        if m is None:
+            print("TIMING: (unavailable — log_stats disabled)")
+        else:
+            prefill = m.first_token_ts - m.scheduled_ts
+            decode = m.last_token_ts - m.first_token_ts
+            rate = (n - 1) / decode if n > 1 and decode > 0 else float("nan")
+            print(
+                f"TIMING: prefill={prefill * 1e3:.1f}ms "
+                f"decode={decode * 1e3:.1f}ms tokens={n} ({rate:.1f} tok/s)"
+            )
+        print(out.outputs[0].text)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True,
@@ -83,6 +141,15 @@ def main() -> int:
         "10240-row buffer.",
     )
     parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="REPL: read prompts from stdin, one generate per line, until "
+        "'exit' or EOF. The engine stays up across requests; the TAPID "
+        "persistent kernel is stopped by the normal shutdown path on exit. "
+        "Max output per prompt is max_model_len minus the prompt's token "
+        "count.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=None,
                         help="vLLM derives the KV-cache budget from this "
                         "fraction minus everything the process holds — and "
@@ -161,6 +228,8 @@ def main() -> int:
         parser.error(
             "--bench-tokens measures prefill only; drop it for decode runs"
         )
+    if args.interactive and args.bench_tokens:
+        parser.error("--interactive and --bench-tokens are exclusive")
     if decode_mode:
         print(
             "TAPID decode mode: greedy argmax ON DEVICE (temperature/top-p "
@@ -257,6 +326,9 @@ def main() -> int:
                         f"see door= lines for per-request batch arrivals"
                     )
         return 0
+
+    if args.interactive:
+        return _run_interactive(llm, args)
 
     out = llm.generate(
         args.prompt or ["The capital of France is"],
