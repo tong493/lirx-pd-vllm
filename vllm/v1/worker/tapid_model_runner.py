@@ -30,7 +30,7 @@ import gc
 import importlib
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -655,6 +655,28 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         """
         self._tapid_input_batch = input_batch
         return super().prepare_attn(input_batch)
+
+    def _update_states(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> Callable | None:
+        """Release finished requests' TAPID slots before anything runs.
+
+        The post-forward release in _decode_sample_tokens only executes when
+        an engine step follows the finish. A serial REPL (one request at a
+        time) finishes a request and then idles — no step runs until the
+        next prompt, whose forward acquires a slot BEFORE that step's
+        post-forward release fires, so all 8 slots were still occupied
+        ("no free slots"). scheduler_output is the earliest point carrying
+        finished_req_ids, and _update_states precedes every
+        _tapid_acquire_slot. Idempotent with the post-forward loop (the
+        req_id is popped from _tapid_req_slot here).
+        """
+        if self.tapid_armed and self.tapid_decode:
+            for req_id in list(scheduler_output.finished_req_ids or ()):
+                slot = self._tapid_req_slot.get(req_id)
+                if slot is not None:
+                    self._tapid_release_slot(req_id, slot)
+        return super()._update_states(scheduler_output)
 
     # ---- forwards ----------------------------------------------------------
     def _model_forward(
