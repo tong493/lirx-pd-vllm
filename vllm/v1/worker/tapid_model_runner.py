@@ -1124,7 +1124,30 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
             "TAPID decode: releasing slot %d (req %s, %d tokens)",
             slot, req_id, self._tapid_generated.get(slot, 0),
         )
-        self.tapid_session.kv_release(slot)
+        try:
+            self.tapid_session.kv_release(slot)
+        except Exception:
+            # kv_release returns failure when the device quiesce ack did not
+            # land: the dead generation's kernels may still hold their page
+            # pointers. TAPID gates the slot against re-arm on its side and
+            # holds its internal pages; mirror that here — the slot and this
+            # generation's filler pages stay out of circulation (never
+            # re-allocated to another request), only the request binding
+            # goes away. _close_tapid_session already wraps this call, so a
+            # poisoned slot cannot block shutdown either.
+            self._tapid_req_slot.pop(req_id, None)
+            self._tapid_awaiting_first.discard(slot)
+            self._tapid_done_slots.discard(slot)
+            logger.exception(
+                "TAPID decode: slot %d release did not quiesce — slot and "
+                "its %d page(s) are poisoned (excluded from reuse; see "
+                "kv_audit)", slot, len(self._tapid_slot_pages.get(slot, ())),
+            )
+            self._tapid_slot_pages.pop(slot, None)
+            self._tapid_prompt_len.pop(slot, None)
+            self._tapid_pending.pop(slot, None)
+            self._tapid_generated.pop(slot, None)
+            return
         self._tapid_page_free.extend(self._tapid_slot_pages.pop(slot, []))
         self._tapid_req_slot.pop(req_id, None)
         self._tapid_prompt_len.pop(slot, None)
