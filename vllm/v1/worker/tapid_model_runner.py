@@ -670,9 +670,18 @@ class TapidGPUModelRunnerV2(GPUModelRunnerV2):
         finished_req_ids, and _update_states precedes every
         _tapid_acquire_slot. Idempotent with the post-forward loop (the
         req_id is popped from _tapid_req_slot here).
+
+        A finished id still present in this step's batch is the async
+        scheduler's optimistic over-schedule past a finish token (the ghost
+        step): its slot must stay armed so the ghost fetch returns the
+        finish token instantly (see _tapid_next_token's done-slot path) —
+        releasing it here re-arms the finished request as fresh and it
+        regenerates forever. The post-forward loop releases those.
         """
         if self.tapid_armed and self.tapid_decode:
             for req_id in list(scheduler_output.finished_req_ids or ()):
+                if req_id in scheduler_output.num_scheduled_tokens:
+                    continue
                 slot = self._tapid_req_slot.get(req_id)
                 if slot is not None:
                     self._tapid_release_slot(req_id, slot)
