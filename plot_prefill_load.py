@@ -12,14 +12,18 @@ carries device-wide GPU metrics and per-kernel records only, no per-SM
 timeline (that would need ncu, which is per-kernel replay, not nsys).
 
 Usage on the A100 box:
-  1. profile (nvtx ranges come from run_vllm_baseline.py's "prefill" range):
+  1. profile (nvtx ranges come from run_vllm_baseline.py's bench loops:
+     "prefill" for prefill-only, e2e_in<N>_serial/par<W>_rep<R> for
+     prefill+decode rounds):
        VLLM_ENABLE_V1_MULTIPROCESSING=0 \
        nsys profile -t cuda,nvtx -o prefill --force-overwrite true \
            --gpu-metrics-devices=cuda-visible \
            python run_vllm_baseline.py --model <dir> --bench-tokens 1024 ...
   2. nsys export --type sqlite -o prefill.sqlite prefill.nsys-rep
   3. python plot_prefill_load.py prefill.sqlite [--out prefill_load.png]
-       [--range K]      K-th (0-based) "prefill" NVTX range, default: last
+       [--range K]      K-th (0-based) matched NVTX range, default: last
+       [--match REGEX]  which NVTX ranges count (default: the bench ranges)
+       [--summary]      one bar chart of mean SM load per matched range
        [--metric NAME]  GPU metric; default: first available of a candidate
                         list (full list printed when nothing matches)
        [--kernels]      add the kernel-activity panel
@@ -28,6 +32,7 @@ Usage on the A100 box:
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
 
@@ -62,16 +67,19 @@ def find_col(cols: list[str], pattern: str) -> str | None:
     return None
 
 
-def nvtx_prefill_ranges(con: sqlite3.Connection, text: str = "prefill"):
-    """[(start_ns, end_ns), ...] of the NVTX ranges named `text`."""
+def nvtx_ranges(con: sqlite3.Connection,
+                pattern: str = r"^(prefill|generate|e2e_|par_in)"):
+    """Sorted [(start_ns, end_ns, text), ...] of NVTX ranges whose text
+    matches `pattern`."""
     cols = columns(con, "NVTX_EVENTS")
     if not cols or "text" not in cols:
         return []
+    rx = re.compile(pattern)
     rows = con.execute(
-        "SELECT start, end FROM NVTX_EVENTS WHERE text = ? AND end IS NOT NULL",
-        (text,),
+        "SELECT start, end, text FROM NVTX_EVENTS "
+        "WHERE text IS NOT NULL AND end IS NOT NULL",
     ).fetchall()
-    return sorted(rows)
+    return sorted((s, e, t) for s, e, t in rows if rx.search(t))
 
 
 def metric_meta(con: sqlite3.Connection):
@@ -247,6 +255,51 @@ def draw_kernel_panel(ax, kernels, t0: int, t1: int, dur: float,
     ax.legend(handles=handles, fontsize=7, ncol=2, loc="lower right")
 
 
+def range_label(text: str, bench_tokens: str | None, bench_reps: int | None,
+                idx: int, n_ranges: int) -> str:
+    """Self-labeled e2e/parallel ranges win; legacy --bench-tokens
+    arithmetic (range order is length-major, rep-minor) otherwise."""
+    if text and re.match(r"^(e2e_in\d+_(serial|par\d+)|par_in\d+_w\d+)_rep\d+$",
+                         text):
+        return text
+    if bench_tokens and bench_reps:
+        lens = [int(x) for x in bench_tokens.split(",") if x.strip()]
+        li, rep = divmod(idx % n_ranges, bench_reps)
+        if li < len(lens):
+            return f"{lens[li]}tok rep{rep}"
+    return text or f"range {idx}"
+
+
+def summary_plot(con: sqlite3.Connection, match: str, metric: str, out: str):
+    """One bar per matched NVTX range: mean SM load over the range span."""
+    entries = []
+    for (t0, t1, text) in nvtx_ranges(con, match):
+        busy = sm_busy_series(con, metric, (t0, t1))
+        if not busy:
+            continue
+        mean = sum(v for _, v in busy) / len(busy)
+        entries.append((text or str(t0), mean, (t1 - t0) / NS_PER_MS))
+    if not entries:
+        print("no matching NVTX range has metric data", file=sys.stderr)
+        return 1
+    fig, ax = plt.subplots(figsize=(4 + 0.5 * len(entries), 5))
+    xs = list(range(len(entries)))
+    means = [e[1] for e in entries]
+    ax.bar(xs, means, color="#2563eb", alpha=0.85)
+    for i, (name, mean, dur) in enumerate(entries):
+        ax.text(i, mean + 1.5, f"{mean:.0f}%\n{dur:.0f}ms",
+                ha="center", fontsize=7)
+    ax.set_xticks(xs, [e[0] for e in entries], rotation=45, ha="right",
+                  fontsize=7)
+    ax.set_ylabel(f"{metric} mean (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title(f"Mean SM load per bench range ({len(entries)} ranges)")
+    ax.grid(axis="y", alpha=0.3)
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"wrote {out}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("sqlite", help="nsys export --type sqlite output")
@@ -255,8 +308,14 @@ def main() -> int:
                     help="GPU metric name (default: first available of "
                          f"{DEFAULT_METRICS}; run once to list all names)")
     ap.add_argument("--range", type=int, default=-1,
-                    help="0-based index of the 'prefill' NVTX range to plot "
+                    help="0-based index of the matched NVTX range to plot "
                          "(default: the last one)")
+    ap.add_argument("--match", default=r"^(prefill|generate|e2e_|par_in)",
+                    help="regex selecting NVTX ranges by text (default: the "
+                         "bench ranges pushed by run_vllm_baseline.py)")
+    ap.add_argument("--summary", action="store_true",
+                    help="one bar chart of mean SM load per matched range, "
+                         "instead of a per-range time curve")
     ap.add_argument("--kernels", action="store_true",
                     help="add the kernel-activity panel (default: metric "
                          "curve only)")
@@ -271,25 +330,6 @@ def main() -> int:
     args = ap.parse_args()
 
     con = sqlite3.connect(args.sqlite)
-    ranges = nvtx_prefill_ranges(con)
-    if ranges:
-        if not -len(ranges) <= args.range < len(ranges):
-            print(f"--range {args.range} out of bounds: "
-                  f"{len(ranges)} 'prefill' ranges found", file=sys.stderr)
-            return 1
-        t0, t1 = ranges[args.range]
-    else:
-        print("no NVTX 'prefill' range found - plotting whole timeline",
-              file=sys.stderr)
-        t0 = t1 = None
-
-    label = f"range {args.range}"
-    if ranges and args.bench_tokens and args.bench_reps:
-        lens = [int(x) for x in args.bench_tokens.split(",") if x.strip()]
-        li, rep = divmod(args.range % len(ranges), args.bench_reps)
-        if li < len(lens):
-            label = f"{lens[li]}tok rep{rep}"
-
     metric = args.metric
     if metric is None:
         names = metric_names(con)
@@ -299,6 +339,26 @@ def main() -> int:
                   file=sys.stderr)
             return 1
         print(f"using metric: {metric}", file=sys.stderr)
+
+    ranges = nvtx_ranges(con, args.match)
+    if args.summary:
+        return summary_plot(con, args.match, metric, args.out)
+    if ranges:
+        if not -len(ranges) <= args.range < len(ranges):
+            print(f"--range {args.range} out of bounds: "
+                  f"{len(ranges)} matched ranges found", file=sys.stderr)
+            return 1
+        t0, t1, text = ranges[args.range]
+    else:
+        print(f"no NVTX range matching {args.match!r} found - plotting "
+              "whole timeline", file=sys.stderr)
+        t0 = t1 = None
+        text = ""
+
+    label = range_label(text, args.bench_tokens, args.bench_reps,
+                        args.range if args.range >= 0
+                        else len(ranges) + args.range,
+                        len(ranges))
 
     busy = sm_busy_series(con, metric, (t0, t1) if t0 is not None else None)
     kernels = kernel_intervals(con) if args.kernels else []
@@ -337,7 +397,7 @@ def main() -> int:
         ax1.text(dur, mean + 2, f"mean {mean:.0f}%", ha="right", fontsize=8,
                  color="gray")
     n_k = f", {len(kernels)} kernel launches" if args.kernels else ""
-    ax1.set_title(f"Prefill SM load — {label} ({dur:.1f} ms{n_k})")
+    ax1.set_title(f"SM load — {label} ({dur:.1f} ms{n_k})")
 
     if ax2 is not None:
         draw_kernel_panel(ax2, kernels, t0, t1, dur, args.gantt)
